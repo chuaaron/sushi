@@ -13,6 +13,7 @@ const std = @import("std");
 const io_util = @import("../io_util.zig");
 const expert_stream = @import("../expert_stream.zig");
 const log = @import("../log.zig");
+const mlx = @import("../mlx.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
 const trunk_mod = @import("../trunk.zig");
 
@@ -1350,11 +1351,36 @@ test "ngram table row dequant reads the dense mx.quantize packing at every width
 /// serially with speculation off (`ownsModuleDecodeState`), which is what
 /// the per-request PLE/indexer state in `SSMCacheEntry.aux_state` needs
 /// until the snapshot machinery carries it.
+pub const ControlVectorLayers = struct {
+    d_col: [48]mlx.mlx_array, // [hidden, 1] bfloat16
+    d_row: [48]mlx.mlx_array, // [1, 1, 1, hidden] bfloat16
+
+    pub fn deinit(self: *ControlVectorLayers) void {
+        for (&self.d_col) |*c| {
+            if (c.ctx != null) {
+                _ = mlx.mlx_array_free(c.*);
+                c.* = .{ .ctx = null };
+            }
+        }
+        for (&self.d_row) |*r| {
+            if (r.ctx != null) {
+                _ = mlx.mlx_array_free(r.*);
+                r.* = .{ .ctx = null };
+            }
+        }
+    }
+};
+
 pub const Qwen4State = struct {
     hash: NgramHash,
     table: NgramTable,
+    control_vectors: ?ControlVectorLayers = null,
 
     pub fn deinit(self: *Qwen4State) void {
+        if (self.control_vectors) |*cvs| {
+            cvs.deinit();
+            self.control_vectors = null;
+        }
         self.table.close();
     }
 };

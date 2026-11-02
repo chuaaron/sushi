@@ -1611,6 +1611,10 @@ pub fn forwardQwen4VerifyRows(
         for (rows[0..initialized], mlp, reads[0..initialized]) |*row, value, read| {
             self.fwd_gen = row.generation;
             try qwen4_hc.hcWriteOrDefer(self, &row.h, value, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending);
+            if (self.arch_state.qwen4.model != null and self.arch_state.qwen4.model.?.control_vectors != null and layer_idx >= 4 and layer_idx <= 44) {
+                try qwen4_hc.hcFlush(self, &row.h, 1, row.seq, &row.pending);
+                row.h = try qwen4_hc.projectControlVector(self, row.h, layer_idx, 1, row.seq);
+            }
         }
     }
 
@@ -1837,6 +1841,10 @@ pub fn forwardQwen4DecodeRows(
         for (live, mlp, mlp_reads[0..n]) |*row, value, read| {
             self.fwd_gen = row.generation;
             try qwen4_hc.hcWriteOrDefer(self, &row.h, value, read.inj, 1, 1, next_inject, &row.pending);
+            if (self.arch_state.qwen4.model != null and self.arch_state.qwen4.model.?.control_vectors != null and layer_idx >= 4 and layer_idx <= 44) {
+                try qwen4_hc.hcFlush(self, &row.h, 1, 1, &row.pending);
+                row.h = try qwen4_hc.projectControlVector(self, row.h, layer_idx, 1, 1);
+            }
         }
     }
 
@@ -2074,6 +2082,10 @@ pub fn forwardQwen4With(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array
             Qwen4Trace.set(&tr.mlp_out, mlp_out);
         };
         if (si.hc) h = try qwen4_hc.hcWrite(self, h, mlp_out, pre2.inj, batch, seq_len) else try qwen4_hc.hcWriteOrDefer(self, &h, mlp_out, pre2.inj, batch, seq_len, if (layer_idx + 1 < layerCap(cfg.num_hidden_layers)) ml[layer_idx + 1].hc_attn.?.inject_flat else .{ .ctx = null }, &pending);
+        if (self.arch_state.qwen4.model != null and self.arch_state.qwen4.model.?.control_vectors != null and layer_idx >= 4 and layer_idx <= 44) {
+            try qwen4_hc.hcFlush(self, &h, batch, seq_len, &pending);
+            h = try qwen4_hc.projectControlVector(self, h, layer_idx, batch, seq_len);
+        }
         if (prof.timing) try qwen4_hc.hcFlush(self, &h, batch, seq_len, &pending);
         try prof.lap(h, .hc_write);
         prof.endLayer(if (lw.ple != null) .ple else if (lw.attn == .linear) .gdn else .attn);

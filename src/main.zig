@@ -442,6 +442,12 @@ fn runCli(init: std.process.Init) !void {
             server_state.g_tool_autocorrect = false;
         } else if (cli_mod.isNoMtpLookupFlag(args[i])) {
             generate_mod.mtp_lookup_disabled = true;
+        } else if ((std.mem.eql(u8, args[i], "--control-vector") or std.mem.eql(u8, args[i], "--cvector")) and flag_value.follows(args, i)) {
+            i += 1;
+            const cv_arg = args[i];
+            const cv_z = try std.fmt.allocPrintSentinel(allocator, "{s}", .{cv_arg}, 0);
+            _ = setenv("SUSHI_CONTROL_VECTOR", cv_z.ptr, 1);
+            log.info("[cli] control vector set to {s}\n", .{cv_arg});
         } else if (std.mem.eql(u8, args[i], "--drafter") and flag_value.follows(args, i)) {
             i += 1;
             drafter_dir = args[i];

@@ -276,6 +276,69 @@ fn load(self: *State, args: arch_state.InitArgs) !?Trunk.ExpertStreamParts {
         st.deinit();
         allocator.destroy(st);
     }
+    if (std.c.getenv("SUSHI_CONTROL_VECTOR")) |c_path| {
+        const cv_path = std.mem.span(c_path);
+        if (cv_path.len > 0) {
+            var loaded_map = mlx.mlx_map_string_to_array_new();
+            defer _ = mlx.mlx_map_string_to_array_free(loaded_map);
+            var meta_map = mlx.mlx_map_string_to_string_new();
+            defer _ = mlx.mlx_map_string_to_string_free(meta_map);
+            const path_z = try std.fmt.allocPrintSentinel(allocator, "{s}", .{cv_path}, 0);
+            defer allocator.free(path_z);
+            const cpu = mlx.mlx_default_cpu_stream_new();
+            defer _ = mlx.mlx_stream_free(cpu);
+            if (mlx.mlx_load_safetensors(&loaded_map, &meta_map, path_z.ptr, cpu) == 0) {
+                var dir_arr = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(dir_arr);
+                if (mlx.mlx_map_string_to_array_get(&dir_arr, loaded_map, "directions") == 0) {
+                    try mlx.check(mlx.mlx_array_eval(dir_arr));
+                    var cv_layers: qwen4_mod.ControlVectorLayers = .{
+                        .d_col = @splat(.{ .ctx = null }),
+                        .d_row = @splat(.{ .ctx = null }),
+                    };
+                    errdefer cv_layers.deinit();
+                    const hidden: c_int = @intCast(config.hidden_size);
+                    const col_shape = [_]c_int{ hidden, 1 };
+                    const row_shape = [_]c_int{ 1, 1, 1, hidden };
+                    for (0..48) |l_idx| {
+                        const l_int: c_int = @intCast(l_idx);
+                        var d_1d = mlx.mlx_array_new();
+                        defer _ = mlx.mlx_array_free(d_1d);
+                        try mlx.check(mlx.mlx_slice(
+                            &d_1d,
+                            dir_arr,
+                            &[_]c_int{ l_int, 0 },
+                            2,
+                            &[_]c_int{ l_int + 1, hidden },
+                            2,
+                            &[_]c_int{ 1, 1 },
+                            2,
+                            s,
+                        ));
+                        var d_bf16 = mlx.mlx_array_new();
+                        defer _ = mlx.mlx_array_free(d_bf16);
+                        try mlx.check(mlx.mlx_astype(&d_bf16, d_1d, .bfloat16, s));
+
+                        var col = mlx.mlx_array_new();
+                        try mlx.check(mlx.mlx_reshape(&col, d_bf16, &col_shape, 2, s));
+                        try mlx.check(mlx.mlx_array_eval(col));
+                        cv_layers.d_col[l_idx] = col;
+
+                        var row = mlx.mlx_array_new();
+                        try mlx.check(mlx.mlx_reshape(&row, d_bf16, &row_shape, 4, s));
+                        try mlx.check(mlx.mlx_array_eval(row));
+                        cv_layers.d_row[l_idx] = row;
+                    }
+                    st.control_vectors = cv_layers;
+                    log.info("[qwen4] loaded & pre-cached control vector from {s} for uncensored projection\n", .{cv_path});
+                } else {
+                    log.err("[qwen4] control vector file {s} missing 'directions' tensor\n", .{cv_path});
+                }
+            } else {
+                log.err("[qwen4] failed to load control vector from {s}\n", .{cv_path});
+            }
+        }
+    }
     if (st.table.rows != st.hash.total_rows or st.table.dim * st.hash.n_heads != config.ple_embed_dim) {
         log.err("[qwen4] ngram_table.bin geometry {d}x{d} does not match the config ({d} rows, {d} heads x dim)\n", .{ st.table.rows, st.table.dim, st.hash.total_rows, st.hash.n_heads });
         return error.NgramTableMismatch;

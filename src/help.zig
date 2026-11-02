@@ -131,6 +131,8 @@ const shared =
     \\  --mtp               Force the MTP head ON. Qwen and MiMo run it by
     \\                        default, GLM does not; an SSD-streamed pack
     \\                        that cannot stream its head refuses --mtp.
+    \\  --control-vector <file> Path to a .safetensors direction file for uncensored
+    \\                        activation projection (Qwen3.8-Flash-Next)
     \\  --drafter <dir>     Use the DFlash2 assistant stored in <dir>. GLM
     \\                        finds the pack's own dflash2/ folder or the
     \\                        released assistant folder beside the weights
