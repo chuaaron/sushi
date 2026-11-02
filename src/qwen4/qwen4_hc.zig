@@ -342,6 +342,50 @@ pub fn hcReadNormed(self: *Transformer, n4: mlx.mlx_array, w: *const HcWeights, 
     return .{ .mixed = mixed, .inj = inj };
 }
 
+/// Apply control vector projection on the 4 HC residual streams:
+/// For layer L in [4, 44]: h_proj = h - (h @ d_col) * d_row
+pub fn projectControlVector(self: *Transformer, stream: mlx.mlx_array, layer_idx: usize, batch: c_int, seq_len: c_int) !mlx.mlx_array {
+    const q4 = self.qwen4 orelse return stream;
+    const cvs = q4.control_vectors orelse return stream;
+    if (layer_idx < 4 or layer_idx > 44) return stream;
+
+    const hc: c_int = @intCast(self.config.hc_count);
+    const hidden: c_int = @intCast(self.config.hidden_size);
+
+    const d_col = cvs.d_col[layer_idx];
+    const d_row = cvs.d_row[layer_idx];
+
+    // Reshape stream [B, S, hc*hidden] -> [B, S, hc, hidden]
+    const shape4 = [_]c_int{ batch, seq_len, hc, hidden };
+    const flat_shape = [_]c_int{ batch, seq_len, hc * hidden };
+    var s4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(s4);
+    try mlx.check(mlx.mlx_reshape(&s4, stream, &shape4, 4, self.s));
+
+    // inner = s4 @ d_col -> [B, S, hc, 1]
+    var inner = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(inner);
+    try mlx.check(mlx.mlx_matmul(&inner, s4, d_col, self.s));
+
+    // proj = inner * d_row -> [B, S, hc, hidden]
+    var proj = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(proj);
+    try mlx.check(mlx.mlx_multiply(&proj, inner, d_row, self.s));
+
+    // h_out = s4 - proj -> [B, S, hc, hidden]
+    var h_out4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(h_out4);
+    try mlx.check(mlx.mlx_subtract(&h_out4, s4, proj, self.s));
+
+    // Flatten back to [B, S, hc*hidden]
+    var res = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(res);
+    try mlx.check(mlx.mlx_reshape(&res, h_out4, &flat_shape, 3, self.s));
+
+    _ = mlx.mlx_array_free(stream);
+    return res;
+}
+
 /// `stream + flatten(out[..., None, :] * inj)`. Consumes `stream`.
 pub fn hcWrite(self: *Transformer, stream: mlx.mlx_array, out: mlx.mlx_array, inj: mlx.mlx_array, batch: c_int, seq_len: c_int) !mlx.mlx_array {
     const hc: c_int = @intCast(self.config.hc_count);

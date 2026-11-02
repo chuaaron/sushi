@@ -1636,6 +1636,10 @@ pub fn forwardQwen4VerifyRows(
         for (rows[0..initialized], mlp, reads[0..initialized]) |*row, value, read| {
             self.fwd_gen = row.generation;
             try self.hcWriteOrDefer(&row.h, value, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending);
+            if (self.qwen4 != null and self.qwen4.?.control_vectors != null and layer_idx >= 4 and layer_idx <= 44) {
+                try self.hcFlush(&row.h, 1, row.seq, &row.pending);
+                row.h = try self.projectControlVector(row.h, layer_idx, 1, row.seq);
+            }
         }
     }
 
@@ -1862,6 +1866,10 @@ pub fn forwardQwen4DecodeRows(
         for (live, mlp, mlp_reads[0..n]) |*row, value, read| {
             self.fwd_gen = row.generation;
             try self.hcWriteOrDefer(&row.h, value, read.inj, 1, 1, next_inject, &row.pending);
+            if (self.qwen4 != null and self.qwen4.?.control_vectors != null and layer_idx >= 4 and layer_idx <= 44) {
+                try self.hcFlush(&row.h, 1, 1, &row.pending);
+                row.h = try self.projectControlVector(row.h, layer_idx, 1, 1);
+            }
         }
     }
 
@@ -2099,6 +2107,10 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
             Qwen4Trace.set(&tr.mlp_out, mlp_out);
         };
         if (si.hc) h = try self.hcWrite(h, mlp_out, pre2.inj, batch, seq_len) else try self.hcWriteOrDefer(&h, mlp_out, pre2.inj, batch, seq_len, if (layer_idx + 1 < layerCap(cfg.num_hidden_layers)) ml[layer_idx + 1].hc_attn.?.inject_flat else .{ .ctx = null }, &pending);
+        if (self.qwen4 != null and self.qwen4.?.control_vectors != null and layer_idx >= 4 and layer_idx <= 44) {
+            try self.hcFlush(&h, batch, seq_len, &pending);
+            h = try self.projectControlVector(h, layer_idx, batch, seq_len);
+        }
         if (prof.timing) try self.hcFlush(&h, batch, seq_len, &pending);
         try prof.lap(h, .hc_write);
         prof.endLayer(if (lw.ple != null) .ple else if (lw.attn == .linear) .gdn else .attn);

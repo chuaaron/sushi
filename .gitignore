@@ -40,6 +40,8 @@ server_err.log
 # Cursor IDE / Cloud Agents. Local tooling only; not for upstream PRs.
 .cursor/
 agent-tools/
+.hermes/
+.idea/
 
 # Speculative-decoding working notes (MTP + PLD planning)
 .mtp-progress.md

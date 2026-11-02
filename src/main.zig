@@ -212,6 +212,8 @@ fn printUsage(io: std.Io) void {
         \\  --mtp               Force the MTP head ON. Qwen and MiMo run it by
         \\                        default, GLM does not; an SSD-streamed pack
         \\                        that cannot stream its head refuses --mtp.
+        \\  --control-vector <file> Path to a .safetensors direction file for uncensored
+        \\                        activation projection (Qwen3.8-Flash-Next)
         \\  --drafter <dir>     Use the DFlash2 assistant stored in <dir>. GLM
         \\                        finds the pack's own dflash2/ folder or the
         \\                        released assistant folder beside the weights
@@ -714,6 +716,12 @@ pub fn main(init: std.process.Init) !void {
             server_mod.g_tool_autocorrect = false;
         } else if (cli_mod.isNoMtpLookupFlag(args[i])) {
             generate_mod.mtp_lookup_disabled = true;
+        } else if ((std.mem.eql(u8, args[i], "--control-vector") or std.mem.eql(u8, args[i], "--cvector")) and i + 1 < args.len) {
+            i += 1;
+            const cv_arg = args[i];
+            const cv_z = try std.fmt.allocPrintSentinel(allocator, "{s}", .{cv_arg}, 0);
+            _ = setenv("SUSHI_CONTROL_VECTOR", cv_z.ptr, 1);
+            log.info("[cli] control vector set to {s}\n", .{cv_arg});
         } else if (std.mem.eql(u8, args[i], "--drafter") and i + 1 < args.len) {
             i += 1;
             drafter_dir = args[i];

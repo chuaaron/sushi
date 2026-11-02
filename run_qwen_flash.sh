@@ -1,0 +1,125 @@
+#!/bin/bash
+set -e
+
+# 支持命令行参数指定，如: ./run_qwen_flash.sh 2.75 或 ./run_qwen_flash.sh 4 --clean
+CLEAR_CACHE=false
+FILTERED_ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --clean|--clear-cache)
+            CLEAR_CACHE=true
+            ;;
+        *)
+            FILTERED_ARGS+=("$arg")
+            ;;
+    esac
+done
+set -- "${FILTERED_ARGS[@]}"
+
+QUANT_CHOICE="$1"
+if [ -n "$QUANT_CHOICE" ]; then
+    shift # 移除位置参数，把后续其他参数留给 sushi serve
+fi
+
+if [ -z "$QUANT_CHOICE" ]; then
+    echo "=========================================="
+    echo "请选择要启动的 Qwen3.8-Flash-Next 版本:"
+    echo "  1) 4bpw                    (推荐用于 96GB+ 机器，wired_limit ~88GB)"
+    echo "  2) 2.75bpw                 (STQ 版本，适用于 64GB 机器，wired_limit ~59GB)"
+    echo "  3) 2.75bpw-uncensored      (STQ 版本 + 去除审查向量 china-v1)"
+    echo "  4) 4bpw-uncensored         (4bpw 版本 + 去除审查向量 china-v1)"
+    echo "=========================================="
+    read -rp "输入选项 [1, 2, 3 或 4，默认 2]: " USER_INPUT
+    case "$USER_INPUT" in
+        2|2.75|2.75bpw|"")
+            QUANT_CHOICE="2.75"
+            ;;
+        3|2.75-uncensored|uncensored)
+            QUANT_CHOICE="2.75-uncensored"
+            ;;
+        4|4-uncensored)
+            QUANT_CHOICE="4-uncensored"
+            ;;
+        1|4|4bpw|*)
+            QUANT_CHOICE="4"
+            ;;
+    esac
+
+    if [ "$CLEAR_CACHE" = false ]; then
+        read -rp "是否清空 SSD 前缀缓存 (~/.sushi/kv-cache)？[y/N，默认 N]: " USER_CACHE_INPUT
+        case "$USER_CACHE_INPUT" in
+            [Yy]*) CLEAR_CACHE=true ;;
+        esac
+    fi
+fi
+
+CVECTOR_FLAG=()
+case "$QUANT_CHOICE" in
+    2|2.75|2.75bpw)
+        TARGET_LIMIT=59000
+        MODEL_NAME="Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw"
+        ;;
+    3|2.75-uncensored|uncensored)
+        TARGET_LIMIT=59000
+        MODEL_NAME="Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw"
+        CVECTOR_FLAG=(--control-vector "$HOME/.lmstudio/models/zjj1993/Qwen3.8-Flash-Next-uncensored-china/china-v1.safetensors")
+        ;;
+    4|4-uncensored)
+        TARGET_LIMIT=88000
+        MODEL_NAME="Qwen3.8-Flash-Next-Sushi-4bpw"
+        CVECTOR_FLAG=(--control-vector "$HOME/.lmstudio/models/zjj1993/Qwen3.8-Flash-Next-uncensored-china/china-v1.safetensors")
+        ;;
+    1|4|4bpw|*)
+        TARGET_LIMIT=88000
+        MODEL_NAME="Qwen3.8-Flash-Next-Sushi-4bpw"
+        ;;
+esac
+
+MODEL_PATH="$HOME/.sushi/models/beamster/$MODEL_NAME"
+
+echo "📦 当前选择模型: $MODEL_NAME"
+
+# 1. 检查并按需设置 macOS 显存上限 (wired_limit_mb)
+CURRENT_LIMIT=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)
+
+if [ "$CURRENT_LIMIT" -lt "$TARGET_LIMIT" ]; then
+    echo "⚙️ 当前 iogpu.wired_limit_mb 为 ${CURRENT_LIMIT}MB，需要设置为 ${TARGET_LIMIT}MB..."
+    sudo sysctl iogpu.wired_limit_mb=$TARGET_LIMIT
+else
+    echo "✅ iogpu.wired_limit_mb 已就绪 (${CURRENT_LIMIT}MB >= ${TARGET_LIMIT}MB)，无需重复设置"
+fi
+
+# 2. 检查模型目录是否存在
+if [ ! -d "$MODEL_PATH" ]; then
+    echo "❌ 错误: 未找到模型目录: $MODEL_PATH"
+    echo "请确认是否已下载完成并放置在 ~/.sushi/models/beamster/$MODEL_NAME"
+    exit 1
+fi
+
+# 3. 按需清理 SSD 前缀缓存
+if [ "$CLEAR_CACHE" = true ]; then
+    CACHE_DIR="$HOME/.sushi/kv-cache"
+    if [ -d "$CACHE_DIR" ]; then
+        echo "🧹 正在清理 SSD 前缀缓存 ($CACHE_DIR/*)..."
+        rm -rf "$CACHE_DIR"/*
+        echo "✨ 缓存已清空"
+    fi
+fi
+
+echo "🚀 启动 sushi 服务 ($MODEL_NAME)..."
+
+# 4. 官方推荐启动参数 (添加 --qwen-gdn 16 优化 GDN 显存带宽，添加 taskpolicy -a 绑定高性能核心)
+exec taskpolicy -a sushi serve \
+  --model "$MODEL_PATH" \
+  --qwen-gdn 16 \
+  ${CVECTOR_FLAG[@]+"${CVECTOR_FLAG[@]}"} \
+  --mtp \
+  --kv-quant 8 \
+  --mtp-head-kv-quant \
+  --ctx-size 500000 \
+  --prefill-chunk 2048 \
+  --max-tokens 64000 \
+  --prefix-cache-disk 20GB \
+  --prefix-cache-entries 1 \
+  --temp 1 "$@"
+
