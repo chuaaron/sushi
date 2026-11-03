@@ -541,6 +541,9 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
 #editButton { flex: none; white-space: nowrap; }
 #editButton[aria-pressed="true"] { color: var(--accent); border-color: currentColor; }
 #editButton[hidden] { display: none; }
+#searchButton { flex: none; white-space: nowrap; }
+#searchButton[aria-pressed="true"] { color: var(--accent); border-color: currentColor; }
+#searchButton[hidden] { display: none; }
 .tool-write > summary { color: var(--accent); }
 .chip-toggle svg { width: 13px; height: 13px; flex: none; }
 .chip-toggle span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -671,6 +674,8 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
   .chip-toggle { max-width: 180px; }
   #editButton { padding: 4px 9px; }
   #editName { display: none; }
+  #searchButton { padding: 4px 9px; }
+  #searchName { display: none; }
 }
 @media (max-width: 560px) {
   .brand .ver { display: none; }
@@ -931,6 +936,7 @@ body[data-mode="advanced"] .cmp { display: none !important; }
   <symbol id="i-sliders" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M4 8h9m5 0h2M4 16h3m5 0h8"/><circle cx="15.5" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="9.5" cy="16" r="2.2" fill="none" stroke="currentColor" stroke-width="2"/></symbol>
   <symbol id="i-pulse" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M3 12h4l2.5-6 4 12 2.5-6h5"/></symbol>
   <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4.5" fill="none" stroke="currentColor" stroke-width="2"/><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="m11.3 11.7 8.2-8.2m-3 3 2.5 2.5m-5-.5 2 2"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="2"/><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="m16 16 4.5 4.5"/></symbol>
 </svg>
 
 <div id="keyOverlay" hidden>
@@ -1011,6 +1017,7 @@ body[data-mode="advanced"] .cmp { display: none !important; }
             <button class="chip-toggle" id="composerModelLabel" title="Choose the model and thinking effort" aria-label="Choose the model and thinking effort"><svg><use href="#i-box"/></svg><span id="composerModelName">no model</span><span>/</span><span id="composerEffortName">—</span></button>
             <button class="chip-toggle" id="directoryButton" title="Choose the folder for this chat's file tools" aria-haspopup="dialog"><span id="directoryName">Folder</span></button>
             <button class="chip-toggle" id="toolsButton" aria-pressed="false" title="Enable web search, page fetching and file tools in the server folder">Tools off</button>
+            <button class="chip-toggle" id="searchButton" aria-pressed="false" hidden title="Let the model search the web via DuckDuckGo"><svg><use href="#i-search"/></svg><span id="searchName">Search off</span></button>
             <button class="chip-toggle" id="editButton" aria-pressed="false" hidden title="Let the model write and edit files in this chat's folder"><svg><use href="#i-pencil"/></svg><span id="editName">Edit off</span></button>
             <span class="spacer"></span>
             <button id="stopButton" aria-label="Stop generating" title="Stop" hidden><svg><use href="#i-stop"/></svg></button>
@@ -2483,6 +2490,7 @@ $("toolsButton").onclick = () => {
   writeStore("sushi-tools", toolsEnabled ? "on" : "off");
   renderToolsButton();
   renderEditButton();
+  renderSearchButton();
 };
 renderToolsButton();
 renderEditButton();
@@ -2526,6 +2534,7 @@ function renderDirectoryButton() {
   $("directoryButton").title = path || "Choose the folder for this chat's file tools";
   $("toolsButton").title = path ? `Web search, page fetching and files under ${path}` : "Enable web search, page fetching and file tools in the server folder";
   renderEditButton();
+  renderSearchButton();
 }
 // Editing works through the file tools, so the chip shows only while Tools is on.
 function renderEditButton() {
@@ -2536,6 +2545,27 @@ function renderEditButton() {
   $("editButton").setAttribute("aria-pressed", String(on));
   $("editButton").title = on ? `The model can write and edit files under ${chatDirectory() || "this chat's folder"}`
     : "Let the model write and edit files in this chat's folder";
+}
+// Search chip: global toggle for web_search, defaults to off.
+var searchEnabled = readStore("sushi-search") === "on";
+function renderSearchButton() {
+  $("searchButton").hidden = !toolsEnabled;
+  $("searchButton").disabled = !!chatAbort;
+  $("searchName").textContent = searchEnabled ? "Search on" : "Search off";
+  $("searchButton").setAttribute("aria-pressed", String(searchEnabled));
+  $("searchButton").title = searchEnabled
+    ? "The model can search the web via DuckDuckGo"
+    : "Let the model search the web via DuckDuckGo";
+}
+$("searchButton").onclick = () => {
+  searchEnabled = !searchEnabled;
+  writeStore("sushi-search", searchEnabled ? "on" : "off");
+  renderSearchButton();
+};
+renderSearchButton();
+function activeToolPack(tools) {
+  if (!tools) return null;
+  return searchEnabled ? tools : tools.filter((t) => t.function?.name !== "web_search");
 }
 async function loadEditDefault() {
   try {
@@ -2797,6 +2827,7 @@ function setChatBusy(busy) {
   $("sendButton").hidden = busy;
   $("stopButton").hidden = !busy;
   renderEditButton();
+  renderSearchButton();
 }
 async function runResearchTurn(model, messages, signal, tools, vision, directory, edit) {
   const nudge = { role: "user", content: "You have used every tool round for this question. Answer now from the results above, without calling tools." };
@@ -2849,7 +2880,8 @@ async function runTurn(chat) {
       renderDirectoryButton();
       $("toolsButton").title = `Web search, page fetching and files under ${pack.root}`;
     }
-    await runResearchTurn(model, chat.messages, chatAbort.signal, pack?.tools, vision, pack?.root, !!chat.edit);
+    const activeTools = activeToolPack(pack?.tools);
+    await runResearchTurn(model, chat.messages, chatAbort.signal, activeTools, vision, pack?.root, !!chat.edit);
     if (chatAbort.signal.aborted) toast("Stopped", "ok");
   } catch (error) {
     if (chatAbort.signal.aborted) toast("Stopped", "ok");

@@ -119,6 +119,7 @@ console.log('Web UI tool labels: passed');
 const editStart = script.indexOf('function chatDirectory(');
 const editNodes = {};
 const editEl = (id) => (editNodes[id] ??= { id, textContent: '', title: '', disabled: null, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } });
+const store = {};
 const editCtx = vm.createContext({
   $: editEl,
   toolsEnabled: true,
@@ -127,6 +128,8 @@ const editCtx = vm.createContext({
   draftDirectory: '',
   draftEdit: false,
   editDefault: false,
+  readStore: (k) => store[k],
+  writeStore: (k, v) => { store[k] = v; },
   touchChat: () => {},
   callResearchTools: async () => ({ edit_default: true }),
 });
@@ -170,4 +173,42 @@ vm.runInContext(script.slice(editStart, script.indexOf('let folderSelection', ed
   editCtx.renderEditButton();
   assert.equal(editNodes.editButton.disabled, true, 'fixed while a reply runs');
   console.log('Web UI edit chip: per-chat state, folder reset, --edit default passed');
+
+  /* The search chip: global toggle for web_search, defaults to off, hidden when tools off. */
+  assert.equal(typeof editCtx.renderSearchButton, 'function', 'renderSearchButton exists');
+  assert.equal(editCtx.searchEnabled, false, 'search defaults to off');
+  editCtx.toolsEnabled = false;
+  editCtx.renderSearchButton();
+  assert.equal(editNodes.searchButton.hidden, true, 'hidden when tools off');
+  editCtx.toolsEnabled = true;
+  editCtx.renderSearchButton();
+  assert.equal(editNodes.searchButton.hidden, false, 'visible when tools on');
+  assert.equal(editNodes.searchName.textContent, 'Search off');
+  assert.equal(editNodes.searchButton.attrs['aria-pressed'], 'false');
+
+  editNodes.searchButton.onclick();
+  assert.equal(editCtx.searchEnabled, true);
+  assert.equal(store['sushi-search'], 'on');
+  assert.equal(editNodes.searchName.textContent, 'Search on');
+  assert.equal(editNodes.searchButton.attrs['aria-pressed'], 'true');
+
+  const testTools = [
+    { type: 'function', function: { name: 'web_search' } },
+    { type: 'function', function: { name: 'read_file' } },
+  ];
+  assert.deepEqual(editCtx.activeToolPack(testTools), testTools, 'when search on, all tools kept');
+
+  editNodes.searchButton.onclick();
+  assert.equal(editCtx.searchEnabled, false);
+  assert.equal(store['sushi-search'], 'off');
+  assert.equal(editNodes.searchName.textContent, 'Search off');
+  assert.equal(editNodes.searchButton.attrs['aria-pressed'], 'false');
+  assert.deepEqual(editCtx.activeToolPack(testTools), [{ type: 'function', function: { name: 'read_file' } }], 'when search off, web_search filtered out');
+  assert.equal(editCtx.activeToolPack(null), null);
+  assert.equal(editCtx.activeToolPack(undefined), null);
+
+  editCtx.chatAbort = {};
+  editCtx.renderSearchButton();
+  assert.equal(editNodes.searchButton.disabled, true, 'disabled while running');
+  console.log('Web UI search chip: toggle, filter, and visibility passed');
 })().catch((error) => { console.error(error); process.exit(1); });
