@@ -879,7 +879,7 @@ fn constTimeEql(a: []const u8, b: []const u8) bool {
 
 /// Extract a query-string parameter from the RAW (un-stripped) request path,
 /// e.g. `queryParamValue("/metrics?api_key=abc", "api_key") == "abc"`.
-fn queryParamValue(raw_path: []const u8, name: []const u8) ?[]const u8 {
+pub fn queryParamValue(raw_path: []const u8, name: []const u8) ?[]const u8 {
     const qpos = std.mem.indexOfScalar(u8, raw_path, '?') orelse return null;
     var it = std.mem.splitScalar(u8, raw_path[qpos + 1 ..], '&');
     while (it.next()) |pair| {

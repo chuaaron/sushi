@@ -8,6 +8,7 @@ const metrics_mod = @import("metrics.zig");
 const request_log = @import("request_log.zig");
 const spec_stats = @import("spec_stats.zig");
 const io_util = @import("io_util.zig");
+const usage_stats = @import("usage_stats.zig");
 const disk_placement = @import("disk_placement.zig");
 const model_registry_mod = @import("model_registry.zig");
 const log = @import("log.zig");
@@ -259,9 +260,19 @@ fn logFinished(m: *metrics_mod.Metrics, slot: anytype, end: request_log.End) voi
 
 /// Count a slot's outcome once; the first path to reach the slot wins.
 fn recordSlotEnd(metrics: ?*metrics_mod.Metrics, slot: anytype, outcome: metrics_mod.Outcome) void {
-    const m = metrics orelse return;
     if (slot.metrics_recorded) return;
     slot.metrics_recorded = true;
+    if (outcome == .success) {
+        usage_stats.global_store.recordRequestNow(
+            slot.model.id,
+            slot.prompt_tokens,
+            slot.cached_tokens,
+            slot.completion_tokens,
+            slot.prefill_ns,
+            slot.decode_ns,
+        );
+    }
+    const m = metrics orelse return;
     logFinished(m, slot, switch (outcome) {
         .success => .ok,
         .cancelled => .cancelled,

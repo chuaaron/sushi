@@ -91,6 +91,7 @@ test {
     _ = @import("mrope.zig");
     _ = @import("metal_minify.zig");
     _ = @import("prefetch_plan.zig");
+    _ = @import("usage_stats.zig");
     _ = @import("sushibar/sushibar_logic.zig");
     _ = @import("sushibar/sushibar_proc.zig");
 }

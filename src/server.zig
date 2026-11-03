@@ -131,6 +131,7 @@ const extractJsonField = request_parse.extractJsonField;
 const chatTemplateKwargBool = request_parse.chatTemplateKwargBool;
 const parseKvQuantOverride = request_parse.parseKvQuantOverride;
 const unescapeJsonSlashes = request_parse.unescapeJsonSlashes;
+const usage_stats = @import("usage_stats.zig");
 /// Number of live per-connection threads. Incremented before each spawn,
 /// decremented when the thread's handler returns. On shutdown, `serve` waits
 /// for this to reach 0 before returning (which runs `scheduler.deinit`) — a
@@ -911,6 +912,8 @@ pub fn serve(
     scheduler_mod.vision_fit_fault = &towerFitFaultText;
     defer scheduler_mod.vision_encode_available = null;
 
+    usage_stats.global_store.loadDefault();
+    defer usage_stats.global_store.storeDefault();
     // Idle eviction (--idle-evict-secs). Same lifetime shape as the sampler,
     // and never in `Scheduler.deinit` — see `IdleEvictCtx.stop`.
     var idle_evict_thread: ?std.Thread = null;
@@ -1304,12 +1307,26 @@ pub fn handleConnection(
                 try history.writer.writeAll(",");
                 try m.finished.writeSince(stream.io, since, &history.writer);
             }
+            if (history.written().len > 0) try history.writer.writeAll(",");
+            try history.writer.writeAll("\"usage\":");
+            try usage_stats.global_store.writeJson(io_util.nowSecs(stream.io), .today, null, &history.writer);
             try instr.renderJsonWith(m, liveSessions(registry, &sessions), if (history.written().len > 0) history.written() else null, &out.writer);
             // Quiet: dashboards poll this ~1 Hz — don't log the body.
             try sendResponseQuiet(stream, "200 OK", "application/json", out.written());
         } else {
             try sendResponse(stream, "503 Service Unavailable", "application/json", "{\"error\":\"metrics not enabled — start with --metrics, or POST /metrics/enable\"}");
         }
+        return;
+    }
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/usage")) {
+        const range_str = http_conn.queryParamValue(raw_path, "range") orelse "today";
+        const model_filter = http_conn.queryParamValue(raw_path, "model");
+        const range = usage_stats.Range.fromString(range_str);
+
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try usage_stats.global_store.writeJson(io_util.nowSecs(stream.io), range, model_filter, &out.writer);
+        try sendResponseQuiet(stream, "200 OK", "application/json", out.written());
         return;
     }
     if (std.mem.eql(u8, method, "OPTIONS")) {
@@ -2960,6 +2977,8 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
         .prefilling = @intCast(@min(ctx.metrics.requests_prefilling.load(), std.math.maxInt(u16))),
         .batched = @intCast(@min(ctx.metrics.batched_group_size.load(), std.math.maxInt(u16))),
     });
+
+    usage_stats.global_store.storeDefault();
 }
 
 const IdleEvictCtx = struct {

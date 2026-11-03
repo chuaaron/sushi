@@ -442,6 +442,11 @@ launch flag is gone ([flags](flags.md#removed)). Built-in GLM and DeepSeek words
 - `/props` `memory.total_bytes` = the machine's physical RAM (`hw.memsize`), the ceiling the Compact view's Memory tile and chart measure against.
 - `/props` `memory.kv_cache_bytes` = the current model's hot-cache residency + every live slot's state, published
   each tick with or without `--metrics`; a donated checkout's buffers, which the entry bills until release, count once.
+- **Usage history and Serving Stats** (`GET /v1/usage`):
+  Aggregated local serving statistics persisted to `~/.sushi/usage_history.json` with 400-day rolling retention.
+  Supports `range=today|yesterday|7d|30d|all` and optional `model=<name>`.
+  Returns `{range, requests, total_tokens, prompt_tokens, output_tokens, cached_tokens, cache_efficiency_pct, prefill_speed_tok_s, decode_speed_tok_s, models:[...]}`.
+  Also embedded in `/metrics.json` under the `"usage"` key for real-time dashboard display with zero extra scrape overhead.
 
 ## SSD prefix cache and settings (`/v1/prefix-cache`, `/v1/settings`)
 

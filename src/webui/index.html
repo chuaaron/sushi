@@ -682,6 +682,33 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
   #composerModelLabel { flex: 1 1 auto; min-width: 0; max-width: none; }
   #composerEffortName { flex: none; }
 }
+
+/* Serving stats & Usage history (oMLX layout) */
+#dashPanel .stats-section-head { display: flex; align-items: center; justify-content: space-between; margin: 12px 0 6px; }
+#dashPanel .stats-title { font-size: 12px; font-weight: 700; letter-spacing: .06em; color: var(--text-2); text-transform: uppercase; }
+#dashPanel .stats-sub { font-size: 11.5px; color: var(--text-2); margin-top: 2px; }
+#dashPanel .stats-actions { display: flex; align-items: center; gap: 8px; }
+#dashPanel .segmented { display: inline-flex; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 2px; gap: 2px; }
+#dashPanel .seg-btn { border: none; background: transparent; padding: 3px 10px; font-size: 12px; font-weight: 600; border-radius: 6px; cursor: pointer; color: var(--text-2); }
+#dashPanel .seg-btn.active { background: var(--c2); color: #fff; }
+#dashPanel .icon-btn-subtle { border: 1px solid var(--border); background: var(--surface); color: var(--text-2); border-radius: 8px; padding: 4px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; }
+#dashPanel .icon-btn-subtle:hover { color: var(--text); border-color: var(--text-2); }
+#dashPanel .icon-btn-subtle svg { width: 14px; height: 14px; }
+#dashPanel .stats-grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+#dashPanel .stats-grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+#dashPanel .stats-grid-5 { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
+@media (max-width: 600px) {
+  #dashPanel .stats-grid-3, #dashPanel .stats-grid-2 { grid-template-columns: 1fr; }
+  #dashPanel .stats-grid-5 { grid-template-columns: repeat(2, 1fr); }
+}
+#dashPanel .stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; min-width: 0; }
+#dashPanel .stat-k { font-size: 11px; font-weight: 650; color: var(--text-2); letter-spacing: .04em; text-transform: uppercase; margin-bottom: 4px; }
+#dashPanel .stat-v { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.15; color: var(--text); }
+#dashPanel .stat-v .unit { font-size: 13px; font-weight: 500; color: var(--text-2); margin-left: 4px; }
+#dashPanel .active-now-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; font-size: 13.5px; color: var(--text-2); text-align: center; }
+#dashPanel .active-now-card.busy { color: var(--c2); font-weight: 600; text-align: left; }
+#dashPanel .history-controls { display: flex; flex-wrap: wrap; gap: 12px; margin: 6px 0 10px; align-items: center; }
+#dashPanel .history-controls label { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text-2); font-weight: 550; }
 </style>
 </head>
 <body>
@@ -883,6 +910,64 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
     <div class="pk-h">Charts<span>Tick the ones to show. Drag a chart by its strip, or use its arrows, to reorder.</span></div>
     <div class="pk-list" id="dashPickList"></div>
     <div class="pk-f"><button id="dashPickReset" class="btn sm" type="button">Reset</button><button id="dashPickDone" class="btn sm primary" type="button">Done</button></div>
+  </section>
+  <section class="card feed stats-overview">
+    <div class="stats-section-head">
+      <div class="stats-title">Serving Stats</div>
+      <div class="stats-actions">
+        <div class="segmented">
+          <button type="button" class="seg-btn active" id="statsScopeSession">Session</button>
+          <button type="button" class="seg-btn" id="statsScopeAll">All Time</button>
+        </div>
+        <button type="button" class="icon-btn-subtle" id="statsResetSession" title="Reset session stats" aria-label="Reset session stats">
+          <svg><use href="#i-trash"/></svg>
+        </button>
+      </div>
+    </div>
+    <div class="stats-grid-3">
+      <div class="stat-card"><div class="stat-k">Total Prefill Tokens</div><div class="stat-v" id="statPrefillTokens">-</div></div>
+      <div class="stat-card"><div class="stat-k">Cached Tokens</div><div class="stat-v" id="statCachedTokens">-</div></div>
+      <div class="stat-card"><div class="stat-k">Cache Efficiency</div><div class="stat-v" id="statCacheEfficiency">-%</div></div>
+    </div>
+
+    <div class="stats-section-head">
+      <div class="stats-title">Average Speed</div>
+    </div>
+    <div class="stats-grid-2">
+      <div class="stat-card"><div class="stat-k">Prompt Processing (excl. cached)</div><div class="stat-v" id="statAvgPrefillSpeed">-</div></div>
+      <div class="stat-card"><div class="stat-k">Token Generation</div><div class="stat-v" id="statAvgDecodeSpeed">-</div></div>
+    </div>
+
+    <div class="stats-section-head">
+      <div class="stats-title">Active Now</div>
+    </div>
+    <div class="active-now-card" id="statActiveNow">Server idle — no models loaded</div>
+
+    <div class="stats-section-head" style="margin-top:16px">
+      <div>
+        <div class="stats-title">Usage History</div>
+        <div class="stats-sub">Local aggregates · server local time · 400-day retention</div>
+      </div>
+    </div>
+    <div class="history-controls">
+      <label>Time range <select id="historyRange">
+        <option value="today" selected>Today</option>
+        <option value="yesterday">Yesterday</option>
+        <option value="7d">Last 7 days</option>
+        <option value="30d">Last 30 days</option>
+        <option value="all">All time</option>
+      </select></label>
+      <label>Model <select id="historyModel">
+        <option value="all" selected>All Models</option>
+      </select></label>
+    </div>
+    <div class="stats-grid-5">
+      <div class="stat-card"><div class="stat-k">Requests</div><div class="stat-v" id="histRequests">-</div></div>
+      <div class="stat-card"><div class="stat-k">Total Tokens</div><div class="stat-v" id="histTotalTokens">-</div></div>
+      <div class="stat-card"><div class="stat-k">Prompt Tokens</div><div class="stat-v" id="histPromptTokens">-</div></div>
+      <div class="stat-card"><div class="stat-k">Output Tokens</div><div class="stat-v" id="histOutputTokens">-</div></div>
+      <div class="stat-card"><div class="stat-k">Cached Tokens</div><div class="stat-v" id="histCachedTokens">-</div></div>
+    </div>
   </section>
   <section class="cmp cm-strip">
     <span class="badge" id="dashCmState">Not loaded</span>
@@ -5007,6 +5092,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     put($('t-served'), compact(g.generation_tokens_live || c.generation_tokens_total || 0));
     put($('t-served-s'), `output tokens, ${compact(pt)} input`);
     sessions(d.sessions || [], now, g);
+    renderServingStats(c, g, h, d);
     drawAll();
   }
 
@@ -5466,6 +5552,119 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     e.v = e.from + (to - e.from) * (1 - (1 - p) ** 3);
     if (p < 1 && !easeFrame) easeFrame = requestAnimationFrame(() => { easeFrame = 0; drawAll(); });
     return e.v;
+  }
+
+  let statsScope = 'session';
+  let sessionBase = null;
+  try { sessionBase = JSON.parse(localStorage.getItem('sushi-session-base') || 'null'); } catch {}
+
+  const el = id => document.getElementById(id);
+
+  el('statsScopeSession')?.addEventListener('click', () => {
+    statsScope = 'session';
+    el('statsScopeSession')?.classList.add('active');
+    el('statsScopeAll')?.classList.remove('active');
+    if (lastData) render(lastData);
+  });
+  el('statsScopeAll')?.addEventListener('click', () => {
+    statsScope = 'all';
+    el('statsScopeAll')?.classList.add('active');
+    el('statsScopeSession')?.classList.remove('active');
+    if (lastData) render(lastData);
+  });
+  el('statsResetSession')?.addEventListener('click', () => {
+    if (!lastCounters) return;
+    sessionBase = {
+      prompt: lastCounters.prompt_tokens_total || 0,
+      cached: lastCounters.prefix_cache_tokens_total || 0,
+      prefill: lastCounters.prefill_tokens_total || 0,
+      gen: lastCounters.generation_tokens_total || 0,
+      pre_sum: lastHists?.prefill_time_seconds?.sum || 0,
+      dec_sum: lastHists?.decode_time_seconds?.sum || 0,
+    };
+    try { localStorage.setItem('sushi-session-base', JSON.stringify(sessionBase)); } catch {}
+    if (lastData) render(lastData);
+  });
+
+  el('historyRange')?.addEventListener('change', () => fetchUsageHistory());
+  el('historyModel')?.addEventListener('change', () => fetchUsageHistory());
+
+  function renderServingStats(c, g, h, d) {
+    const isSession = statsScope === 'session';
+    const base = isSession && sessionBase ? sessionBase : { prompt: 0, cached: 0, prefill: 0, gen: 0, pre_sum: 0, dec_sum: 0 };
+
+    const prompt = Math.max(0, (c.prompt_tokens_total || 0) - base.prompt);
+    const cached = Math.max(0, (c.prefix_cache_tokens_total || 0) - base.cached);
+    const eff = prompt > 0 ? (cached / prompt * 100) : 0;
+
+    if (el('statPrefillTokens')) el('statPrefillTokens').textContent = compact(prompt);
+    if (el('statCachedTokens')) el('statCachedTokens').textContent = compact(cached);
+    if (el('statCacheEfficiency')) el('statCacheEfficiency').textContent = (prompt > 0 ? fmt(eff, 1) : '-') + '%';
+
+    const prefillToks = Math.max(0, (c.prefill_tokens_total || 0) - base.prefill);
+    const prefillSec = Math.max(0, (h.prefill_time_seconds?.sum || 0) - base.pre_sum);
+    const prefillRate = prefillSec > 0 ? (prefillToks / prefillSec) : null;
+
+    const genToks = Math.max(0, (c.generation_tokens_total || 0) - base.gen);
+    const genSec = Math.max(0, (h.decode_time_seconds?.sum || 0) - base.dec_sum);
+    const genRate = genSec > 0 ? (genToks / genSec) : null;
+
+    if (el('statAvgPrefillSpeed')) setValue(el('statAvgPrefillSpeed'), prefillRate ? fmt(prefillRate, 1) : '-', prefillRate ? 'tok/s' : '');
+    if (el('statAvgDecodeSpeed')) setValue(el('statAvgDecodeSpeed'), genRate ? fmt(genRate, 1) : '-', genRate ? 'tok/s' : '');
+
+    if (el('statActiveNow')) {
+      const running = g.requests_running || 0;
+      const ready = modelList.filter(m => m.state === 'ready').map(m => shortName(m.id));
+      if (running > 0) {
+        el('statActiveNow').textContent = `Running ${running} request(s) on ${ready[0] || 'model'}`;
+        el('statActiveNow').className = 'active-now-card busy';
+      } else {
+        el('statActiveNow').textContent = ready.length ? `Server idle — ${ready.join(', ')} ready` : 'Server idle — no models loaded';
+        el('statActiveNow').className = 'active-now-card';
+      }
+    }
+
+    if (d.usage && el('historyRange')?.value === 'today' && el('historyModel')?.value === 'all') {
+      updateUsageHistoryUi(d.usage);
+      if (d.usage.models) syncUsageModelsDropdown(d.usage.models);
+    }
+  }
+
+  async function fetchUsageHistory() {
+    const range = el('historyRange')?.value || 'today';
+    const model = el('historyModel')?.value || 'all';
+    try {
+      const r = await api(`/v1/usage?range=${encodeURIComponent(range)}&model=${encodeURIComponent(model)}`);
+      if (r.ok) {
+        const data = await r.json();
+        updateUsageHistoryUi(data);
+        if (data.models) syncUsageModelsDropdown(data.models);
+      }
+    } catch {}
+  }
+
+  function updateUsageHistoryUi(u) {
+    if (el('histRequests')) el('histRequests').textContent = fmtInt(u.requests || 0);
+    if (el('histTotalTokens')) el('histTotalTokens').textContent = compact(u.total_tokens || 0);
+    if (el('histPromptTokens')) el('histPromptTokens').textContent = compact(u.prompt_tokens || 0);
+    if (el('histOutputTokens')) el('histOutputTokens').textContent = compact(u.output_tokens || 0);
+    if (el('histCachedTokens')) el('histCachedTokens').textContent = compact(u.cached_tokens || 0);
+  }
+
+  function syncUsageModelsDropdown(models) {
+    const sel = el('historyModel');
+    if (!sel || !Array.isArray(models)) return;
+    const current = sel.value;
+    const existing = new Set([...sel.options].map(o => o.value));
+    for (const m of models) {
+      if (m && !existing.has(m)) {
+        const opt = document.createElement('option');
+        opt.value = m;
+        opt.textContent = m.split('/').pop();
+        sel.appendChild(opt);
+      }
+    }
+    sel.value = current;
   }
   const hover = {}; // canvas id -> mouse x/y in CSS px while the pointer is over it
   const charts = {}; // canvas id -> last draw geometry, for hit-testing
