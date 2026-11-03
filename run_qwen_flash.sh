@@ -1,13 +1,20 @@
 #!/bin/bash
 set -e
 
-# 支持命令行参数指定，如: ./run_qwen_flash.sh 2.75 或 ./run_qwen_flash.sh 4 --clean
+# 支持命令行参数指定，如: ./run_qwen_flash.sh 2.75 或 ./run_qwen_flash.sh 2.75 --cool 或 ./run_qwen_flash.sh 4 --clean
 CLEAR_CACHE=false
+THERMAL_MODE=""
 FILTERED_ARGS=()
 for arg in "$@"; do
     case "$arg" in
         --clean|--clear-cache)
             CLEAR_CACHE=true
+            ;;
+        --cool|--eco)
+            THERMAL_MODE="cool"
+            ;;
+        --perf|--performance)
+            THERMAL_MODE="perf"
             ;;
         *)
             FILTERED_ARGS+=("$arg")
@@ -51,7 +58,26 @@ if [ -z "$QUANT_CHOICE" ]; then
             [Yy]*) CLEAR_CACHE=true ;;
         esac
     fi
+
+    if [ -z "$THERMAL_MODE" ]; then
+        echo "------------------------------------------"
+        echo "请选择温控运行模式:"
+        echo "  1) 低温护机模式 (推荐日常: 降温省电, 限制MTP深度, Prefill保持2048满速)"
+        echo "  2) 极致性能模式 (满血全开, 深度投机~50-58 tok/s, 发热与风扇较大)"
+        echo "------------------------------------------"
+        read -rp "输入模式选项 [1 或 2，默认 1]: " THERMAL_CHOICE
+        case "$THERMAL_CHOICE" in
+            2|perf|performance)
+                THERMAL_MODE="perf"
+                ;;
+            1|cool|eco|*)
+                THERMAL_MODE="cool"
+                ;;
+        esac
+    fi
 fi
+
+THERMAL_MODE="${THERMAL_MODE:-cool}"
 
 CVECTOR_FLAG=()
 case "$QUANT_CHOICE" in
@@ -108,8 +134,26 @@ fi
 
 echo "🚀 启动 sushi 服务 ($MODEL_NAME)..."
 
-# 4. 官方推荐启动参数 (添加 --qwen-gdn 16 优化 GDN 显存带宽，添加 taskpolicy -a 绑定高性能核心)
-exec taskpolicy -a sushi serve \
+# 4. 组装温控与启动参数
+THERMAL_FLAGS=()
+RUN_CMD=(sushi serve)
+
+if [ "$THERMAL_MODE" = "cool" ]; then
+    echo "❄️ 温控模式: 低温护机已激活 (MTP深度限3, 保持Prefill 2048, 关闭GPU空闲保温)"
+    THERMAL_FLAGS+=(
+        --mtp-max-depth 3
+        --prefill-chunk 2048
+        --gpu-warm-secs 0
+    )
+else
+    echo "🔥 运行模式: 极致性能已激活 (全频调度, 深度投机)"
+    RUN_CMD=(taskpolicy -a sushi serve)
+    THERMAL_FLAGS+=(
+        --prefill-chunk 2048
+    )
+fi
+
+exec "${RUN_CMD[@]}" \
   --model "$MODEL_PATH" \
   --qwen-gdn 16 \
   ${CVECTOR_FLAG[@]+"${CVECTOR_FLAG[@]}"} \
@@ -117,7 +161,7 @@ exec taskpolicy -a sushi serve \
   --kv-quant 8 \
   --mtp-head-kv-quant \
   --ctx-size 500000 \
-  --prefill-chunk 2048 \
+  "${THERMAL_FLAGS[@]}" \
   --max-tokens 64000 \
   --prefix-cache-disk 20GB \
   --prefix-cache-entries 1 \
