@@ -82,11 +82,11 @@ THERMAL_MODE="${THERMAL_MODE:-cool}"
 CVECTOR_FLAG=()
 case "$QUANT_CHOICE" in
     2|2.75|2.75bpw)
-        TARGET_LIMIT=59000
+        TARGET_LIMIT=69000
         MODEL_NAME="Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw"
         ;;
     3|2.75-uncensored|uncensored)
-        TARGET_LIMIT=59000
+        TARGET_LIMIT=69000
         MODEL_NAME="Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw"
         CVECTOR_FLAG=(--control-vector "$HOME/.lmstudio/models/zjj1993/Qwen3.8-Flash-Next-uncensored-china/china-v1.safetensors")
         ;;
