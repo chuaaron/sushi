@@ -72,6 +72,7 @@ const models_api = @import("models_api.zig");
 const prefix_cache_admin = @import("prefix_cache_admin.zig");
 const metrics_history = @import("metrics_history.zig");
 const settings_api = @import("settings_api.zig");
+const usage_stats = @import("usage_stats.zig");
 const logprobs = @import("logprobs.zig");
 /// Global flag set by signal handler for graceful shutdown.
 pub var shutdown_requested = std.atomic.Value(bool).init(false);
@@ -1244,6 +1245,9 @@ pub fn serve(
     scheduler_mod.vision_fit_fault = &towerFitFaultText;
     defer scheduler_mod.vision_encode_available = null;
 
+    usage_stats.global_store.loadDefault();
+    defer usage_stats.global_store.storeDefault();
+
     if (instr.current() != null) {
         startGaugeSampler() catch |err| log.err("metrics gauge sampler failed to start: {s}\n", .{@errorName(err)});
         log.info("Prometheus metrics: ENABLED — GET http://{s}:{d}/metrics and /metrics.json\n", .{ host, port });
@@ -1639,12 +1643,26 @@ pub fn handleConnection(
             var history: std.Io.Writer.Allocating = .init(allocator);
             defer history.deinit();
             if (metrics_history.sinceParam(raw_path)) |since| try metrics_history.process.writeSince(stream.io, since, &history.writer);
+            if (history.written().len > 0) try history.writer.writeAll(",");
+            try history.writer.writeAll("\"usage\":");
+            try usage_stats.global_store.writeJson(io_util.nowSecs(stream.io), .today, null, &history.writer);
             try instr.renderJsonWith(m, liveSessions(registry, &sessions), if (history.written().len > 0) history.written() else null, &out.writer);
             // Quiet: dashboards poll this ~1 Hz — don't log the body.
             try sendResponseQuiet(stream, "200 OK", "application/json", out.written());
         } else {
             try sendResponse(stream, "503 Service Unavailable", "application/json", "{\"error\":\"metrics not enabled — start with --metrics, or POST /metrics/enable\"}");
         }
+        return;
+    }
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/usage")) {
+        const range_str = http_conn.queryParamValue(raw_path, "range") orelse "today";
+        const model_filter = http_conn.queryParamValue(raw_path, "model");
+        const range = usage_stats.Range.fromString(range_str);
+
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try usage_stats.global_store.writeJson(io_util.nowSecs(stream.io), range, model_filter, &out.writer);
+        try sendResponseQuiet(stream, "200 OK", "application/json", out.written());
         return;
     }
     if (std.mem.eql(u8, method, "OPTIONS")) {
@@ -8269,6 +8287,8 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
         .prefilling = @intCast(@min(ctx.metrics.requests_prefilling.load(), std.math.maxInt(u16))),
         .batched = @intCast(@min(ctx.metrics.batched_group_size.load(), std.math.maxInt(u16))),
     });
+
+    usage_stats.global_store.storeDefault();
 }
 
 const IdleEvictCtx = struct {

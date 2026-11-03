@@ -3,6 +3,7 @@ const mlx = @import("mlx.zig");
 const generate_mod = @import("generate.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const metrics_mod = @import("metrics.zig");
+const usage_stats = @import("usage_stats.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
 const disk_placement = @import("disk_placement.zig");
 const model_registry_mod = @import("model_registry.zig");
@@ -227,9 +228,19 @@ fn cleanupOutcome(slot: anytype) metrics_mod.Outcome {
 
 /// Count a slot's outcome once; the first path to reach the slot wins.
 fn recordSlotEnd(metrics: ?*metrics_mod.Metrics, slot: anytype, outcome: metrics_mod.Outcome) void {
-    const m = metrics orelse return;
     if (slot.metrics_recorded) return;
     slot.metrics_recorded = true;
+    if (outcome == .success) {
+        usage_stats.global_store.recordRequestNow(
+            slot.model.id,
+            slot.prompt_tokens,
+            slot.cached_tokens,
+            slot.completion_tokens,
+            slot.prefill_ns,
+            slot.decode_ns,
+        );
+    }
+    const m = metrics orelse return;
     m.recordRequest(
         outcome,
         slot.first_token_ns,
