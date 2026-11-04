@@ -1,9 +1,16 @@
 #!/bin/bash
 set -e
 
-# 支持命令行参数指定，如: ./run_qwen_flash.sh 2.75 或 ./run_qwen_flash.sh 2.75 --cool 或 ./run_qwen_flash.sh 4 --clean
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOCAL_BIN="$SCRIPT_DIR/zig-out/bin/sushi"
+OFFICIAL_BIN="$(which sushi 2>/dev/null || echo "/opt/homebrew/bin/sushi")"
+
+# 支持命令行参数指定，如:
+#   ./run_qwen_flash.sh 2.75 --local --cool
+#   ./run_qwen_flash.sh 4 --official --perf --clean
 CLEAR_CACHE=false
 THERMAL_MODE=""
+BIN_CHOICE=""
 FILTERED_ARGS=()
 for arg in "$@"; do
     case "$arg" in
@@ -15,6 +22,12 @@ for arg in "$@"; do
             ;;
         --perf|--performance)
             THERMAL_MODE="perf"
+            ;;
+        --local|--dev)
+            BIN_CHOICE="local"
+            ;;
+        --official|--brew|--system)
+            BIN_CHOICE="official"
             ;;
         *)
             FILTERED_ARGS+=("$arg")
@@ -75,6 +88,23 @@ if [ -z "$QUANT_CHOICE" ]; then
                 ;;
         esac
     fi
+
+    if [ -z "$BIN_CHOICE" ]; then
+        echo "------------------------------------------"
+        echo "请选择运行的 Sushi 程序内核:"
+        echo "  1) 本地自编译版 (推荐: ./zig-out/bin/sushi, 含最新WebUI、联网搜索与统计面板)"
+        echo "  2) 官方正式版   (Homebrew: $OFFICIAL_BIN)"
+        echo "------------------------------------------"
+        read -rp "输入内核选项 [1 或 2，默认 1]: " BIN_INPUT
+        case "$BIN_INPUT" in
+            2|official|brew|system)
+                BIN_CHOICE="official"
+                ;;
+            1|local|dev|*)
+                BIN_CHOICE="local"
+                ;;
+        esac
+    fi
 fi
 
 THERMAL_MODE="${THERMAL_MODE:-cool}"
@@ -132,15 +162,25 @@ if [ "$CLEAR_CACHE" = true ]; then
     fi
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SUSHI_BIN="${SUSHI_BIN:-$SCRIPT_DIR/zig-out/bin/sushi}"
-if [ ! -x "$SUSHI_BIN" ]; then
-    SUSHI_BIN="$(which sushi 2>/dev/null || echo sushi)"
+# 4. 解析选择的 Sushi 二进制程序
+BIN_CHOICE="${BIN_CHOICE:-local}"
+if [ "$BIN_CHOICE" = "official" ]; then
+    SUSHI_BIN="$OFFICIAL_BIN"
+    BIN_DESC="官方正式版 ($OFFICIAL_BIN)"
+else
+    if [ -x "$LOCAL_BIN" ]; then
+        SUSHI_BIN="$LOCAL_BIN"
+        BIN_DESC="本地自编译版 ($LOCAL_BIN)"
+    else
+        echo "⚠️ 未在本地检测到编译好的程序 ($LOCAL_BIN)，回退至官方正式版 ($OFFICIAL_BIN)"
+        SUSHI_BIN="$OFFICIAL_BIN"
+        BIN_DESC="官方正式版 (自动回退)"
+    fi
 fi
 
-echo "🚀 启动 sushi 服务 ($MODEL_NAME, binary: $SUSHI_BIN)..."
+echo "🚀 启动 sushi 服务 ($MODEL_NAME | 内核: $BIN_DESC)..."
 
-# 4. 组装温控与启动参数
+# 5. 组装温控与启动参数
 THERMAL_FLAGS=()
 RUN_CMD=("$SUSHI_BIN" serve)
 
