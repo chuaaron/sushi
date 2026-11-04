@@ -132,11 +132,17 @@ if [ "$CLEAR_CACHE" = true ]; then
     fi
 fi
 
-echo "🚀 启动 sushi 服务 ($MODEL_NAME)..."
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SUSHI_BIN="${SUSHI_BIN:-$SCRIPT_DIR/zig-out/bin/sushi}"
+if [ ! -x "$SUSHI_BIN" ]; then
+    SUSHI_BIN="$(which sushi 2>/dev/null || echo sushi)"
+fi
+
+echo "🚀 启动 sushi 服务 ($MODEL_NAME, binary: $SUSHI_BIN)..."
 
 # 4. 组装温控与启动参数
 THERMAL_FLAGS=()
-RUN_CMD=(sushi serve)
+RUN_CMD=("$SUSHI_BIN" serve)
 
 if [ "$THERMAL_MODE" = "cool" ]; then
     echo "❄️ 温控模式: 低温护机已激活 (MTP深度限3, 保持Prefill 2048, 关闭GPU空闲保温)"
@@ -147,7 +153,7 @@ if [ "$THERMAL_MODE" = "cool" ]; then
     )
 else
     echo "🔥 运行模式: 极致性能已激活 (全频调度, 深度投机)"
-    RUN_CMD=(taskpolicy -a sushi serve)
+    RUN_CMD=(taskpolicy -a "$SUSHI_BIN" serve)
     THERMAL_FLAGS+=(
         --prefill-chunk 2048
     )
