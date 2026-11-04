@@ -7,10 +7,11 @@ OFFICIAL_BIN="$(which sushi 2>/dev/null || echo "/opt/homebrew/bin/sushi")"
 
 # 支持命令行参数指定，如:
 #   ./run_qwen_flash.sh 2.75 --local --cool
-#   ./run_qwen_flash.sh 4 --official --perf --clean
+#   ./run_qwen_flash.sh 4 --official --perf --clean --public
 CLEAR_CACHE=false
 THERMAL_MODE=""
 BIN_CHOICE=""
+BIND_ALL=""
 FILTERED_ARGS=()
 for arg in "$@"; do
     case "$arg" in
@@ -28,6 +29,12 @@ for arg in "$@"; do
             ;;
         --official|--brew|--system)
             BIN_CHOICE="official"
+            ;;
+        --public|--lan|--0.0.0.0|--host-all)
+            BIND_ALL=true
+            ;;
+        --localhost|--local-only|--127.0.0.1)
+            BIND_ALL=false
             ;;
         *)
             FILTERED_ARGS+=("$arg")
@@ -105,6 +112,15 @@ if [ -z "$QUANT_CHOICE" ]; then
                 ;;
         esac
     fi
+
+    if [ -z "$BIND_ALL" ]; then
+        echo "------------------------------------------"
+        read -rp "是否绑定到 0.0.0.0 开放局域网访问？[y/N，默认 N (仅限本机 127.0.0.1)]: " USER_BIND_INPUT
+        case "$USER_BIND_INPUT" in
+            [Yy]*) BIND_ALL=true ;;
+            *) BIND_ALL=false ;;
+        esac
+    fi
 fi
 
 THERMAL_MODE="${THERMAL_MODE:-cool}"
@@ -180,7 +196,17 @@ fi
 
 echo "🚀 启动 sushi 服务 ($MODEL_NAME | 内核: $BIN_DESC)..."
 
-# 5. 组装温控与启动参数
+# 5. 组装网络绑定参数
+BIND_ALL="${BIND_ALL:-false}"
+HOST_FLAGS=()
+if [ "$BIND_ALL" = true ]; then
+    HOST_FLAGS=(--host 0.0.0.0)
+    echo "🌐 网络绑定: 0.0.0.0 (局域网设备可访问)"
+else
+    echo "🔒 网络绑定: 127.0.0.1 (仅限本机访问)"
+fi
+
+# 6. 组装温控与启动参数
 THERMAL_FLAGS=()
 RUN_CMD=("$SUSHI_BIN" serve)
 
@@ -201,6 +227,7 @@ fi
 
 exec "${RUN_CMD[@]}" \
   --model "$MODEL_PATH" \
+  ${HOST_FLAGS[@]+"${HOST_FLAGS[@]}"} \
   --qwen-gdn 16 \
   ${CVECTOR_FLAG[@]+"${CVECTOR_FLAG[@]}"} \
   --mtp \
