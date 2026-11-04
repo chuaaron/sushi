@@ -6,15 +6,16 @@ LOCAL_BIN="$SCRIPT_DIR/zig-out/bin/sushi"
 OFFICIAL_BIN="$(which sushi 2>/dev/null || echo "/opt/homebrew/bin/sushi")"
 
 # 支持命令行参数指定，如:
-#   ./run_qwen_flash.sh 2.75 --local --cool
-#   ./run_qwen_flash.sh 4 --official --perf --clean --public
+#   ./run_qwen_flash.sh 2.75 --local --cool --256k
+#   ./run_qwen_flash.sh 4 --official --perf --clean --public --500k
 CLEAR_CACHE=false
 THERMAL_MODE=""
 BIN_CHOICE=""
 BIND_ALL=""
+CTX_SIZE=""
 FILTERED_ARGS=()
-for arg in "$@"; do
-    case "$arg" in
+while [ $# -gt 0 ]; do
+    case "$1" in
         --clean|--clear-cache)
             CLEAR_CACHE=true
             ;;
@@ -36,12 +37,37 @@ for arg in "$@"; do
         --localhost|--local-only|--127.0.0.1)
             BIND_ALL=false
             ;;
+        --256k|--256K)
+            CTX_SIZE=262144
+            ;;
+        --500k|--500K)
+            CTX_SIZE=500000
+            ;;
+        --128k|--128K)
+            CTX_SIZE=131072
+            ;;
+        --ctx|--ctx-size)
+            if [ -n "$2" ]; then
+                CTX_SIZE="$2"
+                shift
+            fi
+            ;;
+        --ctx=*|--ctx-size=*)
+            CTX_SIZE="${1#*=}"
+            ;;
         *)
-            FILTERED_ARGS+=("$arg")
+            FILTERED_ARGS+=("$1")
             ;;
     esac
+    shift
 done
 set -- "${FILTERED_ARGS[@]}"
+
+case "$CTX_SIZE" in
+    256k|256K) CTX_SIZE=262144 ;;
+    500k|500K) CTX_SIZE=500000 ;;
+    128k|128K) CTX_SIZE=131072 ;;
+esac
 
 QUANT_CHOICE="$1"
 if [ -n "$QUANT_CHOICE" ]; then
@@ -109,6 +135,34 @@ if [ -z "$QUANT_CHOICE" ]; then
                 ;;
             1|local|dev|*)
                 BIN_CHOICE="local"
+                ;;
+        esac
+    fi
+
+    if [ -z "$CTX_SIZE" ]; then
+        echo "------------------------------------------"
+        echo "请选择最大上下文大小 (Context Size):"
+        echo "  1) 256K (262,144 tokens, 默认推荐: 显存充裕, Prefill维持宽Chunk满血)"
+        echo "  2) 500K (500,000 tokens, 极限超长上下文)"
+        echo "  3) 128K (131,072 tokens, 轻量级日常开发)"
+        echo "------------------------------------------"
+        read -rp "输入上下文选项 [1, 2 或 3，默认 1]: " CTX_INPUT
+        case "$CTX_INPUT" in
+            2|500|500k|500K)
+                CTX_SIZE=500000
+                ;;
+            3|128|128k|128K)
+                CTX_SIZE=131072
+                ;;
+            1|256|256k|256K|"")
+                CTX_SIZE=262144
+                ;;
+            *)
+                if [[ "$CTX_INPUT" =~ ^[0-9]+$ ]]; then
+                    CTX_SIZE="$CTX_INPUT"
+                else
+                    CTX_SIZE=262144
+                fi
                 ;;
         esac
     fi
@@ -194,7 +248,9 @@ else
     fi
 fi
 
+CTX_SIZE="${CTX_SIZE:-262144}"
 echo "🚀 启动 sushi 服务 ($MODEL_NAME | 内核: $BIN_DESC)..."
+echo "🧠 上下文容量: $((CTX_SIZE / 1024))K (${CTX_SIZE} tokens)"
 
 # 5. 组装网络绑定参数
 BIND_ALL="${BIND_ALL:-false}"
@@ -233,7 +289,7 @@ exec "${RUN_CMD[@]}" \
   --mtp \
   --kv-quant 8 \
   --mtp-head-kv-quant \
-  --ctx-size 500000 \
+  --ctx-size "$CTX_SIZE" \
   "${THERMAL_FLAGS[@]}" \
   --max-tokens 64000 \
   --prefix-cache-disk 20GB \
