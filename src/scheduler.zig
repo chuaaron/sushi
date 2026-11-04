@@ -989,6 +989,15 @@ pub const UnloadRequest = struct {
     done_cond: std.Io.Condition = .init,
 };
 
+const ColdLoadDisk = struct { bytes: u64, stride: u32 };
+
+/// The SSD ask and checkpoint stride a cold load starts with: the settings as they are now, since
+/// `POST /v1/settings` may have changed the ask since boot. `raw_stride` is the launch stride before the ask gates it.
+fn coldLoadDisk(raw_stride: u32, capacity: u32, ram_enabled: bool) ColdLoadDisk {
+    const ask = @import("server.zig").diskAsk();
+    return .{ .bytes = ask.bytes, .stride = @import("server.zig").effectiveSsmCheckpointStride(raw_stride, capacity, ram_enabled, ask.bytes) };
+}
+
 // Connection-local transport preserves a load diagnostic across a concurrent retry.
 threadlocal var last_load_context_refusal: ?model_registry_mod.MemoryContextRefusal = null;
 
@@ -1033,7 +1042,6 @@ pub const Scheduler = struct {
     prefix_cache_ram_enabled: bool,
     prefix_cache_mem_bytes: u64,
     prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64,
-    prefix_cache_disk_bytes: u64,
     prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8, u64) ?disk_placement.DefaultDiskBudget,
     ssd_budget_bytes: u64,
     expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void,
@@ -1194,11 +1202,15 @@ pub const Scheduler = struct {
     /// Owned, dupe'd error name (e.g. "MissingVisionWeights"). null on
     /// success. Freed in `deinit`.
     load_error_name: ?[]const u8,
+    /// Set (under `started_mu`) once the startup load has passed every refusal that runs before its weights load.
+    prechecked: bool,
+    /// The launch model's claim reference (`ModelRegistry.claimStartupLoad`), held until `releaseStartupPin`.
+    startup_pin: ?*LoadedModel,
 
-    /// Construct a Scheduler whose inference thread loads the model. Returns
-    /// only after load + (optional) warmup completes. On load failure, returns
-    /// `error.LoadFailed`; the inference thread has already cleaned up any
-    /// partially-allocated mlx state by then.
+    /// Construct a Scheduler whose inference thread loads the model. Returns once that load has passed every refusal
+    /// that runs before its weights load (`model_load.signalPrechecked`); the load runs on, and `awaitStartupLoad`
+    /// waits for it. A refusal returns `error.LoadFailed` here, before anything listens; the inference thread has
+    /// already cleaned up any partially-allocated mlx state by then.
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -1238,7 +1250,6 @@ pub const Scheduler = struct {
             .prefix_cache_ram_enabled = params.prefix_cache_ram_enabled,
             .prefix_cache_mem_bytes = params.prefix_cache_mem_bytes,
             .prefix_cache_mem_resolver = params.prefix_cache_mem_resolver,
-            .prefix_cache_disk_bytes = params.prefix_cache_disk_bytes,
             .prefix_cache_disk_resolver = params.prefix_cache_disk_resolver,
             .ssd_budget_bytes = params.ssd_budget_bytes,
             .expert_cache_fit_resolver = params.expert_cache_fit_resolver,
@@ -1283,29 +1294,52 @@ pub const Scheduler = struct {
             .started_cond = .init,
             .load_failed = std.atomic.Value(bool).init(false),
             .load_error_name = null,
+            .prechecked = false,
+            .startup_pin = null,
         };
+
+        if (!params.no_initial_load and params.registry.claimStartupLoad(
+            params.entry,
+            model_load.gateEstimateBytes(params.entry.bytes_on_disk, params.config.num_hidden_layers, params.config.hidden_size),
+        )) self.startup_pin = params.entry;
+        errdefer self.releaseStartupPin();
 
         const ctx = ThreadCtx{ .scheduler = self, .params = params };
         self.inference_thread = try std.Thread.spawn(.{}, inferenceLoop, .{ctx});
 
-        // Wait until inference thread has loaded the model and (optionally)
-        // warmed up. submit() relies on xfm/weights being live.
         self.started_mu.lockUncancelable(io);
-        defer self.started_mu.unlock(io);
-        while (!self.started.load(.acquire)) {
+        while (!self.started.load(.acquire) and !self.prechecked) {
             self.started_cond.waitUncancelable(io, &self.started_mu);
         }
-
-        if (self.load_failed.load(.acquire)) {
-            // Inference thread already exited cleanly. Join + free + bubble up.
-            if (self.inference_thread) |t| t.join();
-            self.inference_thread = null;
-            const name = self.load_error_name orelse "unknown";
-            log.err("[scheduler] model load failed: {s}\n", .{name});
-            return error.LoadFailed;
-        }
-
+        self.started_mu.unlock(io);
+        if (self.started.load(.acquire)) try self.startupLoadOutcome();
         return self;
+    }
+
+    /// Blocks until the startup load is done. submit() relies on xfm/weights being live.
+    pub fn awaitStartupLoad(self: *Scheduler) !void {
+        self.started_mu.lockUncancelable(self.io);
+        while (!self.started.load(.acquire)) {
+            self.started_cond.waitUncancelable(self.io, &self.started_mu);
+        }
+        self.started_mu.unlock(self.io);
+        try self.startupLoadOutcome();
+    }
+
+    fn startupLoadOutcome(self: *Scheduler) !void {
+        if (!self.load_failed.load(.acquire)) return;
+        // Inference thread already exited cleanly. Join + bubble up.
+        if (self.inference_thread) |t| t.join();
+        self.inference_thread = null;
+        const name = self.load_error_name orelse "unknown";
+        log.err("[scheduler] model load failed: {s}\n", .{name});
+        return error.LoadFailed;
+    }
+
+    pub fn releaseStartupPin(self: *Scheduler) void {
+        const entry = self.startup_pin orelse return;
+        self.startup_pin = null;
+        self.registry.releaseStatus(entry);
     }
 
     pub fn deinit(self: *Scheduler) void {
@@ -1317,6 +1351,7 @@ pub const Scheduler = struct {
         self.queue_mu.unlock(self.io);
 
         if (self.inference_thread) |t| t.join();
+        self.releaseStartupPin();
 
         // Freed below the join: the publisher is gone, so this is the last writer.
         if (self.hot_cache_digests.len > 0) {
@@ -1721,6 +1756,7 @@ pub const Scheduler = struct {
         }
 
         // ── Stage 2: build + post LoadRequest, wait for completion.
+        const cold_disk = coldLoadDisk(self.ssm_checkpoint_stride, self.prefix_cache_capacity, self.prefix_cache_ram_enabled);
         var req = LoadRequest{
             .entry = entry,
             .config = owned.config,
@@ -1743,11 +1779,11 @@ pub const Scheduler = struct {
             .prefix_cache_ram_enabled = self.prefix_cache_ram_enabled,
             .prefix_cache_mem_bytes = self.prefix_cache_mem_bytes,
             .prefix_cache_mem_resolver = self.prefix_cache_mem_resolver,
-            .prefix_cache_disk_bytes = self.prefix_cache_disk_bytes,
+            .prefix_cache_disk_bytes = cold_disk.bytes,
             .prefix_cache_disk_resolver = self.prefix_cache_disk_resolver,
             .ssd_budget_bytes = self.ssd_budget_bytes,
             .expert_cache_fit_resolver = self.expert_cache_fit_resolver,
-            .ssm_checkpoint_stride = self.ssm_checkpoint_stride,
+            .ssm_checkpoint_stride = cold_disk.stride,
             .ssm_checkpoint_max = self.ssm_checkpoint_max,
             // Cold loads honor the launch-flag MTP settings too (same reason
             // as prefix-cache above) — pre-plumbing these were LoadRequest
@@ -2024,6 +2060,22 @@ const ThreadCtx = struct {
 pub var skip_mem_preflight: bool = false;
 
 pub var load_serving_bill: ?*const fn (*const ModelConfig, u64) ?model_load.LoadServingBill = null;
+
+test "a cold load takes the SSD ask and the checkpoint stride the settings hold now, not the boot snapshot" {
+    const srv = @import("server.zig");
+    const saved = srv.diskAsk();
+    defer srv.setDiskAsk(saved.bytes, saved.explicit);
+
+    srv.setDiskAsk(0, true);
+    const off = coldLoadDisk(256, 32, false);
+    try std.testing.expectEqual(@as(u64, 0), off.bytes);
+    try std.testing.expectEqual(@as(u32, 0), off.stride);
+
+    srv.setDiskAsk(40 << 30, true);
+    const on = coldLoadDisk(256, 32, false);
+    try std.testing.expectEqual(@as(u64, 40 << 30), on.bytes);
+    try std.testing.expectEqual(@as(u32, 256), on.stride);
+}
 
 test "a loaded model's hot-cache budget is the resolver's clamp, never the raw launch flag" {
     const Stub = struct {
@@ -2308,7 +2360,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
 
     // ── Phase A1 → Plan 05: load runs on this thread (mlx GPU stream
     //    binding). On failure, mark the entry `.error_state` in the
-    //    registry AND set load_failed so `Scheduler.init`'s parent sees
+    //    registry AND set load_failed so `Scheduler.init` (a refusal) or `awaitStartupLoad` sees
     //    the same shape it always has.
     //
     // Headless boot (`no_initial_load`): start with NO primary model. The

@@ -27,6 +27,8 @@ test {
     _ = @import("kv_disk_writer.zig");
     _ = @import("disk_write_stats.zig");
     _ = @import("metrics_history.zig");
+    _ = @import("request_log.zig");
+    _ = @import("json_text.zig");
     _ = @import("mtp_acceptance.zig");
     _ = @import("mtp_depth_bounds.zig");
     _ = @import("mtp_group_cost.zig");
@@ -36,15 +38,22 @@ test {
     _ = @import("dflash_policy.zig");
     _ = @import("opencode_persist.zig");
     _ = @import("parent_watch.zig");
+    _ = @import("boot_gate.zig");
     _ = @import("repl_input.zig");
     _ = @import("repl_tools.zig");
     _ = @import("update.zig");
+    _ = @import("pack_stamp.zig");
+    _ = @import("hf_pull.zig");
+    _ = @import("pack_update.zig");
     _ = @import("ws.zig");
     _ = @import("gpu_clock.zig");
+    _ = @import("gpu_clock_live.zig");
     _ = @import("bench_box.zig");
     _ = @import("ubench_report.zig");
     _ = @import("mrope.zig");
     _ = @import("metal_minify.zig");
     _ = @import("prefetch_plan.zig");
     _ = @import("usage_stats.zig");
+    _ = @import("sushibar/sushibar_logic.zig");
+    _ = @import("sushibar/sushibar_proc.zig");
 }

@@ -12,6 +12,14 @@ brew install beamivalice/tap/sushi
 curl -L https://github.com/beamivalice/sushi/releases/latest/download/sushi-bin-macos-arm64.tar.gz | tar xz
 ```
 
+The release tarball also holds `sushibar`, a menu bar item for the server: run `sushibar [--port N]` and it detaches from
+the terminal. The title is the live decode tok/s (dim for the last request's once idle). Its menu opens on a status
+card (model, memory, decode, prefill and GPU numbers, a five-minute decode graph) and then starts or stops the server
+on the watched port (asking first for one it did not start), switches the port (pick a listening server or type a number in the field; the choice is remembered; `--port`
+wins, then sushi's default 12345), checks for and installs updates (Homebrew installs get a Copy "brew upgrade sushi"
+item; a running sushibar never blocks `sushi update` and restarts itself on the new version), and opens the
+dashboard, chat, Models and Settings pages (⌘1-⌘4).
+
 A browser download is quarantined: clear it with `xattr -dr com.apple.quarantine sushi-macos-arm64`. GPU memory and the
 largest context per Mac: [README, Memory](../README.md#memory).
 
@@ -20,8 +28,16 @@ largest context per Mac: [README, Memory](../README.md#memory).
 `sushi pull <model>` downloads a pack into `~/.sushi/models/beamster/<repo>`, where `sushi serve` and `sushi run` find it
 by name. `<model>` is a short name (`qwen3.8-flash-next[:tag]`, `mimo-v2.6-flash`, `glm-5.3-flash[:tag]`,
 `deepseek-v4.1-flash`) or `beamster/<repo>`; packs from any other org are refused. A rerun downloads only what is missing
-or short, so it finishes an interrupted pull; until then the folder holds `.pull-incomplete`. A private repo pulls after
+or changed, so it finishes an interrupted pull; until then the folder holds `.pull-incomplete`. A private repo pulls after
 `hf auth login` or with `HF_TOKEN`.
+
+A file is kept by content, never by size: a finished pull leaves `.sushi-pull.json` (repo, Hugging Face commit, and each
+file's size and checksum: sha256 for a large file, the git blob id for a small one) and the next pull skips a file only
+when the repo lists the same checksum. A folder without the manifest (an older sushi, a copy by hand) is hashed once
+(`checking N files already on disk…`) and only the files that differ download. Each download is checked against its
+checksum before it is put in place; a mismatch deletes the partial and fails naming the file. A file the last manifest
+listed that the repo no longer has is removed; nothing else in the folder is touched. `sushi run` still uses a present
+local copy without contacting Hugging Face.
 
 `sushi list` shows each pack's size, whether it is downloaded and whether this Mac meets its tier, and marks the one it
 recommends. A Mac's tier is its installed RAM in whole GB. Below a pack's tier it reads `may stream (--ssd-budget-gb)`:
@@ -39,6 +55,13 @@ it may still run streamed ([README, Streaming](../README.md#streaming)), with no
 
 Sizes are the whole download; a Qwen pack's n-gram table and DeepSeek's 189 GiB of Engram tables stay on the SSD and are
 never loaded. Offline, `sushi list` shows only the models on disk.
+
+A pack carries a revision in `config.json` (`pack_revision.id`; a pack without it is revision 1.0). When Hugging Face
+publishes a higher revision of a pack you have downloaded, `sushi list` prints, under its row,
+`update available: 2.0 (you have 1.0) — sushi pull deepseek-v4.1-flash`. Nothing is printed when the pack is current,
+when its repo is not known (a folder that is neither a catalog pack nor pulled by `sushi pull`) or when Hugging Face
+cannot be reached or answers 404 (a private repo needs `HF_TOKEN`). The server asks the same once after a model loads and
+then once a day, unless `--no-update-check`.
 
 ## Recommended launch
 
@@ -151,6 +174,9 @@ authors recommend; `--ctx-size` and `--max-tokens` still override them.
 - **Pair-major layout:** `sushi repack <pack>` rewrites a pack-order pack in place into the layout the streaming engine
   reads fastest ([pack-format](pack-format.md#repack)). Stop any server using the pack first; it needs free disk of one
   shard plus 1 GiB, and repeating it after an interruption finishes the job.
+  `--pack-revision <id>` also stamps the pack with a revision, `--shards <name-or-glob>` narrows the stamping to some
+  shards, `--unstamped <shard>` leaves one (a symlink) out and `--check` only verifies
+  ([pack-format](pack-format.md#pack-revision-writer)).
 - **`--drop-expert n`** (multiple of 8) skips the `n` least-used experts a layer, freeing 2.1–2.5 GB at 8 and 4.3–5.0 GB
   at 16. It is lossy: check it with `sushi kld compare` ([dsv41-arch](dsv41-arch.md#drop-expert)).
 - **`--ssd-prefetch <n>` (0..100, default 0 = off) turns on the expert prefetch of a streamed DeepSeek load and caps its SSD reads.**

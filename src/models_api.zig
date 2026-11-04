@@ -17,6 +17,7 @@ const model_settings = @import("model_settings.zig");
 const metrics = @import("status.zig");
 const qwen4_mod = @import("qwen4/qwen4_exp.zig");
 const update_mod = @import("update.zig");
+const pack_update = @import("pack_update.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
 const io_util = @import("io_util.zig");
 const build_options = @import("build_options");
@@ -24,6 +25,7 @@ const mtp_plan = @import("mtp_plan.zig");
 const nowSecs = io_util.nowSecs;
 const testing = std.testing;
 const server = @import("server.zig");
+const json_text = @import("json_text.zig");
 const http_conn = @import("http_conn.zig");
 const request_policy = @import("request_policy.zig");
 const Conn = http_conn.Conn;
@@ -167,6 +169,51 @@ test "an unloaded qwen4 stub is text-only only when the checkpoint must stream" 
     try t.expectEqual(@as(?usize, null), std.mem.indexOf(u8, dense_row, "\"image\""));
 }
 
+test "a model row carries bytes_linked beside bytes_on_disk, loaded or not" {
+    const t = std.testing;
+    const io = t.io;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"qwen4_exp\"}" });
+
+    var cfg = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    var chat_cfg = chat_mod.ChatConfig{ .chat_template = "", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = t.allocator };
+    var entry = model_registry_mod.LoadedModel{
+        .allocator = t.allocator,
+        .id = "m",
+        .path = path_buf[0..path_len],
+        .bytes_on_disk = 100,
+        .bytes_linked = 40,
+        .arch_hint = "qwen4_exp",
+        .config = null,
+        .weights = null,
+        .transformer = null,
+        .tokenizer = null,
+        .chat_config = null,
+        .vision_encoder = null,
+        .drafter_path = "",
+        .drafter_block_size = 0,
+        .prefix_cache = null,
+        .refcount = std.atomic.Value(u32).init(0),
+        .last_used_ns = 0,
+        .bytes_resident = 0,
+        .state = .unloaded,
+        .error_name = null,
+    };
+    const stub_row = try renderModelEntry(t.allocator, io, &entry);
+    defer t.allocator.free(stub_row);
+    try t.expect(std.mem.indexOf(u8, stub_row, "\"bytes_on_disk\":100,\"bytes_linked\":40") != null);
+
+    entry.config = &cfg;
+    entry.chat_config = &chat_cfg;
+    entry.state = .ready;
+    const ready_row = try renderModelEntry(t.allocator, io, &entry);
+    defer t.allocator.free(ready_row);
+    try t.expect(std.mem.indexOf(u8, ready_row, "\"bytes_on_disk\":100,\"bytes_linked\":40") != null);
+}
+
 test "a quantized pack loaded resident advertises no streaming, the same pack streamed does" {
     const t = std.testing;
     const io = t.io;
@@ -197,7 +244,7 @@ test "a quantized pack loaded resident advertises no streaming, the same pack st
         .id = "resident",
         .path = path_buf[0..path_len],
         .bytes_on_disk = 0,
-        .arch_hint = "qwen4_exp",
+        .arch_hint = "example_arch",
         .config = &cfg,
         .weights = null,
         .transformer = null,
@@ -347,6 +394,13 @@ pub fn renderModelEntry(
         defer allocator.free(gen_top_p_str);
         const gen_top_k_str = try optSamplingRecJson(allocator, u32, config.gen_top_k);
         defer allocator.free(gen_top_k_str);
+        const pack_revision_str = try packRevisionJson(allocator, config);
+        defer allocator.free(pack_revision_str);
+
+        const pack_update_part = try pack_update.rowFragment(allocator, entry.path);
+        defer allocator.free(pack_update_part);
+        const pack_tail = try std.fmt.allocPrint(allocator, "{s}{s}", .{ pack_revision_str, pack_update_part });
+        defer allocator.free(pack_tail);
 
         var streaming_buf: [96]u8 = undefined;
         const streaming_part = streamingRowPart(
@@ -357,12 +411,13 @@ pub fn renderModelEntry(
         );
 
         return std.fmt.allocPrint(allocator,
-            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"sushi","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s}{s},"batched_decode":{s},"capabilities":{s}{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{s}","context_length":{s},"model_max_tokens":{d},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"kv_quant":"{s}","kv_cache":{{"scheme":"{s}","source":"{s}"}},"gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":{f},"object":"model","created":{d},"owned_by":"sushi","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"bytes_linked":{d},"context_length":{s},"max_model_len":{s}{s},"batched_decode":{s},"capabilities":{s}{s},"input_modalities":{s},"meta":{{"architecture":{f},"engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":{f},"context_length":{s},"model_max_tokens":{d},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"kv_quant":"{s}","kv_cache":{{"scheme":"{s}","source":"{s}"}},"gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s},"pack_revision":{s}}}}}
         , .{
-            model_id,
+            json_text.Str{ .s = model_id },
             nowSecs(io),
             entry.bytes_resident,
             bytes_on_disk_str,
+            entry.bytes_linked,
             // Top-level twins of meta.context_length: openai-models-list
             // discovery clients (oh-my-pi, vLLM-shaped readers) look for
             // row-level max_model_len/context_length and substitute their own
@@ -374,12 +429,12 @@ pub fn renderModelEntry(
             caps.items,
             efforts_part,
             mods.items,
-            config.model_type,
+            json_text.Str{ .s = config.model_type },
             "mlx",
             config.vocab_size,
             config.hidden_size,
             config.num_hidden_layers,
-            quantization,
+            json_text.Str{ .s = quantization },
             ctx_str,
             config.max_position_embeddings,
             if (config.isMoe()) "true" else "false",
@@ -393,6 +448,7 @@ pub fn renderModelEntry(
             gen_temp_str,
             gen_top_p_str,
             gen_top_k_str,
+            pack_tail,
         });
     }
 
@@ -410,12 +466,10 @@ pub fn renderModelEntry(
         try allocator.dupe(u8, "null");
     defer allocator.free(bytes_on_disk_str);
     const err_part: []const u8 = if (entry.error_name) |name| blk: {
-        // Inline escape to avoid double allocation; the names we emit
-        // never contain quotes/backslashes (they're @errorName output).
         break :blk try std.fmt.allocPrint(
             allocator,
-            ",\"error\":\"{s}\"",
-            .{name},
+            ",\"error\":{f}",
+            .{json_text.Str{ .s = name }},
         );
     } else &[_]u8{};
     defer if (err_part.len > 0) allocator.free(err_part);
@@ -491,9 +545,7 @@ pub fn renderModelEntry(
         "";
 
     const arch_part: []const u8 = if (entry.arch_hint.len > 0) blk: {
-        // arch_hint comes from config.json's model_type via discovery — the
-        // supported-type allowlist guarantees no JSON metacharacters.
-        break :blk try std.fmt.allocPrint(allocator, "\"architecture\":\"{s}\",", .{entry.arch_hint});
+        break :blk try std.fmt.allocPrint(allocator, "\"architecture\":{f},", .{json_text.Str{ .s = entry.arch_hint }});
     } else &[_]u8{};
     defer if (arch_part.len > 0) allocator.free(arch_part);
 
@@ -518,11 +570,11 @@ pub fn renderModelEntry(
             .expert_quant_rate = sm.expert_quant_rate orelse .{ .n = 64 },
         });
         defer allocator.free(quantization);
-        break :blk try std.fmt.allocPrint(allocator, "\"vocab_size\":{d},\"hidden_size\":{d},\"num_layers\":{d},\"quantization\":\"{s}\",\"context_length\":{d},\"model_max_tokens\":{d},\"is_moe\":{s},\"mtp_available\":{s},", .{
+        break :blk try std.fmt.allocPrint(allocator, "\"vocab_size\":{d},\"hidden_size\":{d},\"num_layers\":{d},\"quantization\":{f},\"context_length\":{d},\"model_max_tokens\":{d},\"is_moe\":{s},\"mtp_available\":{s},", .{
             sm.vocab_size,
             sm.hidden_size,
             sm.num_hidden_layers,
-            quantization,
+            json_text.Str{ .s = quantization },
             sm.max_position_embeddings,
             sm.max_position_embeddings,
             if (sm.is_moe) "true" else "false",
@@ -532,8 +584,8 @@ pub fn renderModelEntry(
     defer if (dims_part.len > 0) allocator.free(dims_part);
 
     return std.fmt.allocPrint(allocator,
-        \\{{"id":"{s}","object":"model","created":0,"owned_by":"sushi","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
-    , .{ entry.id, state_str, bytes_on_disk_str, streaming_part, err_part, top_ctx_part, caps_part, efforts_part, mods_part, arch_part, engine_part, dims_part, bytes_on_disk_str });
+        \\{{"id":{f},"object":"model","created":0,"owned_by":"sushi","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s},"bytes_linked":{d}{s}{s}{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
+    , .{ json_text.Str{ .s = entry.id }, state_str, bytes_on_disk_str, entry.bytes_linked, streaming_part, err_part, top_ctx_part, caps_part, efforts_part, mods_part, arch_part, engine_part, dims_part, bytes_on_disk_str });
 }
 
 pub fn handleModels(allocator: std.mem.Allocator, stream: *Conn) !void {
@@ -642,9 +694,9 @@ fn renderPropsBody(
     // was invisible: the panel read 19.6 GB of `active_bytes` while the process
     // sat at 81.4 GB, and nothing we served named the other 61.
     return std.fmt.allocPrint(allocator,
-        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"total_bytes":{d},"max_safe_context":{d},"cache_bytes":{d},"kv_cache_bytes":{d},"owned_bytes":{d}}}{s}}}
+        \\{{"default_generation_settings":{{"model":{f},"n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"total_bytes":{d},"max_safe_context":{d},"cache_bytes":{d},"kv_cache_bytes":{d},"owned_bytes":{d}}}{s}}}
     , .{
-        config.model_type,              ctx_str,
+        json_text.Str{ .s = config.model_type }, ctx_str,
         config.vocab_size,              config.hidden_size,
         config.num_hidden_layers,       config.num_attention_heads,
         config.num_key_value_heads,     config.head_dim,
@@ -692,6 +744,8 @@ const PropsSettings = struct {
     mtp_acceptance: mtp_acceptance_mod.Mode,
     mtp_acceptance_source: []const u8 = "default",
     mtp_greedy_tail: model_settings.Pick(bool) = .{ .value = false, .source = .default },
+    /// False on an arch whose drafts the file's acceptance and greedy-tail keys do not reach (DSpark).
+    mtp_acceptance_applies: bool = true,
     /// 0 = auto.
     mtp_depth: u32,
     mtp_adaptive: bool,
@@ -715,11 +769,28 @@ fn propsSettingsFor(lm: *LoadedModel) PropsSettings {
     return mlxPropsSettings(lm);
 }
 
+const MtpAcceptanceReport = struct {
+    acceptance: model_settings.Pick(mtp_acceptance_mod.Mode),
+    greedy_tail: model_settings.Pick(bool),
+    applies: bool,
+};
+
+/// What /props says about acceptance and the greedy tail: on an arch the file's keys do not reach, the file's values are not reported.
+fn mtpAcceptanceReport(config: *const model_mod.ModelConfig) MtpAcceptanceReport {
+    const applies = model_settings.applies("mtp_acceptance", server.settingsFit(config));
+    return .{
+        .acceptance = mtp_plan.mtpAcceptanceFor(if (applies) config.mtp_acceptance_override else null),
+        .greedy_tail = mtp_plan.mtpGreedyTailFor(if (applies) config.mtp_greedy_tail_override else null),
+        .applies = applies,
+    };
+}
+
 fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
     const config = lm.config.?;
     const kv_cache = kvCacheFor(config);
     const kv = kv_cache.config;
-    const acceptance = mtp_plan.mtpAcceptanceFor(config.mtp_acceptance_override);
+    const report = mtpAcceptanceReport(config);
+    const acceptance = report.acceptance;
     // This model's own tier, the four numbers from one publish.
     const disk = lm.disk_stats.snapshot();
     return .{
@@ -733,7 +804,8 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .mtp_choice = mtpChoiceFor(config),
         .mtp_acceptance = acceptance.value,
         .mtp_acceptance_source = model_settings.sourceLabel(acceptance.source, model_settings.acceptanceFlagName(acceptance.value)),
-        .mtp_greedy_tail = mtp_plan.mtpGreedyTailFor(config.mtp_greedy_tail_override),
+        .mtp_greedy_tail = report.greedy_tail,
+        .mtp_acceptance_applies = report.applies,
         .mtp_depth = lm.mtp_depth,
         .mtp_adaptive = generate_mod.Generator.mtpAdaptiveEnabled(),
         .max_mtp_ctx = generate_mod.max_mtp_ctx,
@@ -754,6 +826,10 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
     };
 }
 
+fn js(s: []const u8) json_text.Str {
+    return .{ .s = s };
+}
+
 /// The /props "settings" object: leading-comma fragment spliced before the props root close.
 pub fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
     var param_buf: [32]u8 = undefined;
@@ -762,25 +838,46 @@ pub fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 
         .typical => |t| try std.fmt.bufPrint(&param_buf, "{d}", .{t.delta}),
         .tokenv3 => |a| try std.fmt.bufPrint(&param_buf, "{d}", .{a}),
     };
-    var vision_buf: [160]u8 = undefined;
-    const vision = try std.fmt.bufPrint(&vision_buf, "{{\"loaded\":{},\"source\":\"{s}\",\"streamed_tower_bytes\":{d},\"streamed_encode_bytes\":{d}}}", .{ st.vision.loaded, st.vision.source, st.vision.tower_bytes, st.vision.encode_bytes });
-    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_cache\":{{\"scheme\":\"{s}\",\"source\":\"{s}\"}},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"source\":\"{s}\",\"acceptance_source\":\"{s}\",\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"greedy_tail_source\":\"{s}\",\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"max_concurrent\":{d},\"prefill_decode_share\":{d},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d},\"disk_used_bytes\":{d},\"disk_written_bytes\":{d},\"disk_entries\":{d}}},\"vision\":{s}}}", .{
-        build_options.version,                      st.engine,
-        st.kv_quant,                                st.kv_cache.label(),
-        st.kv_cache.sourceName(),
+    const vision = try std.fmt.allocPrint(allocator, "{{\"loaded\":{},\"source\":{f},\"streamed_tower_bytes\":{d},\"streamed_encode_bytes\":{d}}}", .{ st.vision.loaded, json_text.Str{ .s = st.vision.source }, st.vision.tower_bytes, st.vision.encode_bytes });
+    defer allocator.free(vision);
+    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":{f},\"engine\":{f},\"kv_quant\":{f},\"kv_cache\":{{\"scheme\":{f},\"source\":{f}}},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"source\":{f},\"acceptance_source\":{f},\"acceptance\":{f},\"acceptance_param\":{s},\"acceptance_applies\":{},\"greedy_tail\":{},\"greedy_tail_source\":{f},\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":{f},\"max_concurrent\":{d},\"prefill_decode_share\":{d},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d},\"disk_used_bytes\":{d},\"disk_written_bytes\":{d},\"disk_entries\":{d}}},\"vision\":{s}}}", .{
+        js(build_options.version),                          js(st.engine),
+        js(st.kv_quant),                                    js(st.kv_cache.label()),
+        js(st.kv_cache.sourceName()),
         st.prefill_chunk,
-        st.mtp_loaded,                              st.mtp_default_on,
-        st.mtp_choice.sourceName(),                 st.mtp_acceptance_source,
-        mtp_acceptance_mod.name(st.mtp_acceptance), param,
-        st.mtp_greedy_tail.value,                   model_settings.sourceLabel(st.mtp_greedy_tail.source, "--mtp-greedy-tail"),
-        st.mtp_depth,                               st.mtp_adaptive,
-        st.max_mtp_ctx,                             st.drafter,
-        st.max_concurrent,                          st.prefill_decode_share,
-        st.prefix_cache_ram_enabled,                st.prefix_cache_mem_bytes,
-        st.prefix_cache_disk_bytes,                 st.prefix_cache_disk_used_bytes,
-        st.prefix_cache_disk_written_bytes,         st.prefix_cache_disk_entries,
+        st.mtp_loaded,                                      st.mtp_default_on,
+        js(st.mtp_choice.sourceName()),                     js(st.mtp_acceptance_source),
+        js(mtp_acceptance_mod.name(st.mtp_acceptance)),     param,
+        st.mtp_acceptance_applies,
+        st.mtp_greedy_tail.value,                           js(model_settings.sourceLabel(st.mtp_greedy_tail.source, "--mtp-greedy-tail")),
+        st.mtp_depth,                                       st.mtp_adaptive,
+        st.max_mtp_ctx,                                     js(st.drafter),
+        st.max_concurrent,                                  st.prefill_decode_share,
+        st.prefix_cache_ram_enabled,                        st.prefix_cache_mem_bytes,
+        st.prefix_cache_disk_bytes,                         st.prefix_cache_disk_used_bytes,
+        st.prefix_cache_disk_written_bytes,                 st.prefix_cache_disk_entries,
         vision,
     });
+}
+
+/// The pack's revision as a JSON value: its id, or null for a legacy pack that names none.
+fn packRevisionJson(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig) ![]u8 {
+    const rev = config.pack_revision orelse return allocator.dupe(u8, "null");
+    return std.fmt.allocPrint(allocator, "{f}", .{json_text.Str{ .s = rev.id }});
+}
+
+test "packRevisionJson is the id, or null for a legacy pack" {
+    const stamped_json = try std.mem.concat(testing.allocator, u8, &.{ "{\"pack_revision\":{\"id\":\"2.0\"},", model_mod.QWEN4_YARN[1..] });
+    defer testing.allocator.free(stamped_json);
+    var cfg = try model_mod.parseConfigFromJson(testing.allocator, stamped_json);
+    defer cfg.deinit(testing.allocator);
+    const stamped = try packRevisionJson(testing.allocator, &cfg);
+    defer testing.allocator.free(stamped);
+    try testing.expectEqualStrings("\"2.0\"", stamped);
+    const legacy_cfg = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    const legacy = try packRevisionJson(testing.allocator, &legacy_cfg);
+    defer testing.allocator.free(legacy);
+    try testing.expectEqualStrings("null", legacy);
 }
 
 pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !void {
@@ -818,7 +915,9 @@ pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel
     defer allocator.free(update_json);
     const fallbacks_json = try templateFallbacksPropsJson(allocator, chat_mod.template_fallbacks.load(.monotonic));
     defer allocator.free(fallbacks_json);
-    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s}", .{ ngram_json, batching_json, settings_json, update_json, fallbacks_json });
+    const revision_json = try packRevisionJson(allocator, config);
+    defer allocator.free(revision_json);
+    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s},\"pack_revision\":{s}", .{ ngram_json, batching_json, settings_json, update_json, fallbacks_json, revision_json });
     defer allocator.free(extra_json);
 
     const kv_cache_mem: u64 = if (server.global_scheduler) |sch|
@@ -948,6 +1047,31 @@ test "settingsPropsJson: /props names the vision choice and a streamed tower's b
     try testing.expectEqualStrings("--vision", vision.get("source").?.string);
     try testing.expectEqual(@as(i64, 493_389_824), vision.get("streamed_tower_bytes").?.integer);
     try testing.expectEqual(@as(i64, 5_000_000_000), vision.get("streamed_encode_bytes").?.integer);
+}
+
+test "/props reports acceptance and greedy tail as not applying on an arch that ignores them" {
+    var dsv = model_mod.ModelConfig{};
+    dsv.model_type = model_settings.prefetch_arch;
+    dsv.mtp_acceptance_override = .{ .typical = .{ .delta = 0.2 } };
+    dsv.mtp_greedy_tail_override = true;
+    const ds = mtpAcceptanceReport(&dsv);
+    try testing.expect(!ds.applies);
+    try testing.expectEqualStrings("exact", mtp_acceptance_mod.name(ds.acceptance.value));
+    try testing.expect(!ds.greedy_tail.value);
+    try testing.expect(ds.greedy_tail.source == .default);
+
+    var qwen = dsv;
+    qwen.model_type = "qwen4_exp";
+    const q = mtpAcceptanceReport(&qwen);
+    try testing.expect(q.applies);
+    try testing.expectEqualStrings("typical", mtp_acceptance_mod.name(q.acceptance.value));
+    try testing.expect(q.greedy_tail.value);
+
+    const frag = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .prefill_chunk = 1, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_acceptance_applies = false, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0 });
+    defer testing.allocator.free(frag);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});
+    defer parsed.deinit();
+    try testing.expect(!parsed.value.object.get("mtp").?.object.get("acceptance_applies").?.bool);
 }
 
 test "settingsPropsJson: /props names the effective serving settings a benchmark ran under" {
@@ -1139,6 +1263,85 @@ test "/v1/models rows, loaded or not, name each model's effort words and the one
     }
 }
 
+test "/v1/models rows stay valid JSON for a model id and error name with a quote, a backslash and a control character" {
+    const t = std.testing;
+    const io = t.io;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    var chat_cfg = chat_mod.ChatConfig{ .chat_template = "{{ messages }}", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = t.allocator };
+    const hostile = "q\"b\\c\x01d";
+    var cfg = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    var entry = model_registry_mod.LoadedModel{
+        .allocator = t.allocator,
+        .id = hostile,
+        .path = path,
+        .bytes_on_disk = 0,
+        .arch_hint = "example_arch",
+        .config = &cfg,
+        .weights = null,
+        .transformer = null,
+        .tokenizer = null,
+        .chat_config = &chat_cfg,
+        .vision_encoder = null,
+        .drafter_path = "",
+        .drafter_block_size = 0,
+        .prefix_cache = null,
+        .refcount = std.atomic.Value(u32).init(0),
+        .last_used_ns = 0,
+        .bytes_resident = 0,
+        .state = .ready,
+        .error_name = null,
+    };
+    const loaded = try renderModelEntry(t.allocator, io, &entry);
+    defer t.allocator.free(loaded);
+    const row = try std.json.parseFromSlice(std.json.Value, t.allocator, loaded, .{});
+    defer row.deinit();
+    try t.expectEqualStrings(hostile, row.value.object.get("id").?.string);
+
+    entry.state = .error_state;
+    entry.config = null;
+    entry.chat_config = null;
+    entry.error_name = "bad\"name\\\n";
+    const stub = try renderModelEntry(t.allocator, io, &entry);
+    defer t.allocator.free(stub);
+    const stub_row = try std.json.parseFromSlice(std.json.Value, t.allocator, stub, .{});
+    defer stub_row.deinit();
+    try t.expectEqualStrings(hostile, stub_row.value.object.get("id").?.string);
+    try t.expectEqualStrings("bad\"name\\\n", stub_row.value.object.get("error").?.string);
+}
+
+test "/props stays valid JSON when a settings label carries a quote, a backslash and a control character" {
+    const t = std.testing;
+    const hostile = "--x \"a\\b\x01\"";
+    const json = try settingsPropsJson(t.allocator, .{
+        .engine = "mlx",
+        .kv_quant = "8",
+        .prefill_chunk = 1,
+        .mtp_loaded = false,
+        .mtp_default_on = false,
+        .mtp_acceptance = .exact,
+        .mtp_acceptance_source = hostile,
+        .mtp_depth = 0,
+        .mtp_adaptive = false,
+        .max_mtp_ctx = 0,
+        .drafter = "none",
+        .max_concurrent = 1,
+        .prefix_cache_mem_bytes = 0,
+        .prefix_cache_disk_bytes = 0,
+        .vision = .{ .source = hostile },
+    });
+    defer t.allocator.free(json);
+    const doc = try std.fmt.allocPrint(t.allocator, "{{{s}}}", .{json[1..]});
+    defer t.allocator.free(doc);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, doc, .{});
+    defer parsed.deinit();
+    const settings = parsed.value.object.get("settings").?.object;
+    try t.expectEqualStrings(hostile, settings.get("mtp").?.object.get("acceptance_source").?.string);
+    try t.expectEqualStrings(hostile, settings.get("vision").?.object.get("source").?.string);
+}
+
 fn testQuantizationModelRow(k: ?u8, expected: []const u8, loaded: bool) !void {
     const t = std.testing;
     const io = t.io;
@@ -1200,4 +1403,49 @@ test "model quantization label K4 loaded and unloaded" {
 test "model quantization label affine unchanged" {
     try testQuantizationModelRow(null, "8-bit", true);
     try testQuantizationModelRow(null, "8-bit", false);
+}
+
+test "models row: meta.pack_update appears only for a pack with a newer published revision" {
+    const t = std.testing;
+    var cfg = model_mod.ModelConfig{ .model_type = "example_arch", .quant_bits = 8 };
+    var chat_cfg = chat_mod.ChatConfig{ .chat_template = "", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = t.allocator };
+    var entry = model_registry_mod.LoadedModel{
+        .allocator = t.allocator,
+        .id = "test-pack",
+        .path = "/pack-update-test/ready-row",
+        .bytes_on_disk = 0,
+        .arch_hint = "example_arch",
+        .config = &cfg,
+        .weights = null,
+        .transformer = null,
+        .tokenizer = null,
+        .chat_config = &chat_cfg,
+        .vision_encoder = null,
+        .drafter_path = "",
+        .drafter_block_size = 0,
+        .prefix_cache = null,
+        .refcount = std.atomic.Value(u32).init(0),
+        .last_used_ns = 0,
+        .bytes_resident = 0,
+        .state = .ready,
+        .error_name = null,
+    };
+    const bare = try renderModelEntry(t.allocator, t.io, &entry);
+    defer t.allocator.free(bare);
+    try t.expect(std.mem.indexOf(u8, bare, "pack_update") == null);
+
+    pack_update.record(entry.path, .{ .available = .{ .local = "1.0", .latest = "2.0", .command = "sushi pull example-pack" } });
+    const row = try renderModelEntry(t.allocator, t.io, &entry);
+    defer t.allocator.free(row);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, row, .{});
+    defer parsed.deinit();
+    const up = parsed.value.object.get("meta").?.object.get("pack_update").?.object;
+    try t.expectEqualStrings("1.0", up.get("current").?.string);
+    try t.expectEqualStrings("2.0", up.get("latest").?.string);
+    try t.expectEqualStrings("sushi pull example-pack", up.get("command").?.string);
+
+    pack_update.record(entry.path, .current);
+    const after = try renderModelEntry(t.allocator, t.io, &entry);
+    defer t.allocator.free(after);
+    try t.expect(std.mem.indexOf(u8, after, "pack_update") == null);
 }

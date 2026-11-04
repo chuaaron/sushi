@@ -66,11 +66,14 @@ const completions = @import("completions.zig");
 const responses_api = @import("responses_api.zig");
 const generation_stream = @import("generation_stream.zig");
 const http_conn = @import("http_conn.zig");
+const boot_gate = @import("boot_gate.zig");
 const request_media = @import("request_media.zig");
 const request_policy = @import("request_policy.zig");
 const models_api = @import("models_api.zig");
 const prefix_cache_admin = @import("prefix_cache_admin.zig");
 const metrics_history = @import("metrics_history.zig");
+const gpu_clock_live = @import("gpu_clock_live.zig");
+const json_text = @import("json_text.zig");
 const settings_api = @import("settings_api.zig");
 const usage_stats = @import("usage_stats.zig");
 const logprobs = @import("logprobs.zig");
@@ -120,7 +123,7 @@ pub var listen_host: []const u8 = default_host;
 pub var listen_port: u16 = default_port;
 
 pub const default_host: []const u8 = "127.0.0.1";
-pub const default_port: u16 = 12345;
+pub const default_port: u16 = @import("default_port.zig").port;
 
 pub const BindConfig = struct {
     host: []const u8,
@@ -267,7 +270,7 @@ fn mtpHeadDefaultOn(config: *const model_mod.ModelConfig) bool {
     return choice.on and model_mod.isServedArch(config.model_type) and (!config.expert_streaming or config.stream_mtp_head);
 }
 
-/// Explicit launch choice, available to memory bills before Scheduler.init returns.
+/// Explicit launch choice, for the bills a load runs before `global_scheduler` is published.
 var configured_mtp: ?bool = null;
 
 /// THIS model's MTP decision and its source, the answer the load log and `/props` read.
@@ -623,11 +626,43 @@ pub fn clearResolvedPrefixCacheMem() void {
 pub var prefix_cache_disk_bytes: u64 = disk_placement.DEFAULT_DISK_CAP;
 /// Set by `--prefix-cache-disk`: the operator's number is the budget as given.
 pub var prefix_cache_disk_explicit = false;
+/// The explicit number came from `model-settings.json`, not the flag.
+pub var prefix_cache_disk_from_file = false;
+
+pub const DiskAsk = struct {
+    bytes: u64,
+    explicit: bool,
+    from_file: bool,
+
+    pub fn sourceName(self: DiskAsk) []const u8 {
+        return if (self.from_file) "model-settings.json" else "--prefix-cache-disk";
+    }
+};
+
+/// The ask as of now. `POST /v1/settings` changes it from a connection thread while loads and bills read it, so
+/// every read after boot comes through here.
+pub fn diskAsk() DiskAsk {
+    const explicit = @atomicLoad(bool, &prefix_cache_disk_explicit, .acquire);
+    return .{ .bytes = @atomicLoad(u64, &prefix_cache_disk_bytes, .monotonic), .explicit = explicit, .from_file = @atomicLoad(bool, &prefix_cache_disk_from_file, .monotonic) };
+}
+
+/// The settings API's write: an explicit number is the file's. Publishes the bytes before the explicit bit, so a
+/// reader that sees `explicit` sees its number.
+pub fn setDiskAsk(bytes: u64, explicit: bool) void {
+    @atomicStore(bool, &prefix_cache_disk_from_file, explicit, .monotonic);
+    if (explicit) {
+        @atomicStore(u64, &prefix_cache_disk_bytes, bytes, .monotonic);
+        @atomicStore(bool, &prefix_cache_disk_explicit, true, .release);
+    } else {
+        @atomicStore(bool, &prefix_cache_disk_explicit, false, .release);
+        @atomicStore(u64, &prefix_cache_disk_bytes, bytes, .monotonic);
+    }
+}
 
 /// Does THIS model run with an SSD tier? The launch asked for one and its load did not decline it
 /// (`ModelConfig.prefix_cache_disk_declined`); every bill, budget and checkpoint policy reads this.
 pub fn diskTierOn(config: *const model_mod.ModelConfig) bool {
-    return prefix_cache_disk_bytes > 0 and !config.prefix_cache_disk_declined;
+    return diskAsk().bytes > 0 and !config.prefix_cache_disk_declined;
 }
 
 /// The SSD writer's permit, sized once from host RAM at startup (`kv_disk_writer.permitForRam`); the
@@ -636,7 +671,7 @@ pub var disk_writer_permit_bytes: u64 = kv_disk_writer.DEFAULT_PERMIT_BYTES;
 
 /// The disk bytes the SSD-tier-dependent policies read: the launch ask, or 0 for a model whose tier is off.
 fn diskBytesFor(config: *const model_mod.ModelConfig) u64 {
-    return if (diskTierOn(config)) prefix_cache_disk_bytes else 0;
+    return if (diskTierOn(config)) diskAsk().bytes else 0;
 }
 
 /// Phase 1 (performance-plan): SSM/conv state snapshot stride during prefill,
@@ -1177,13 +1212,16 @@ pub fn parseToolCallsForRequest(
 /// `cfg` carries all process-wide defaults (context size, timeouts, PLD
 /// defaults, reasoning budget). It's copied into the module-level
 /// `server_config` before the listen loop starts.
+///
+/// Order: bind; start the launch model's load and wait out its refusals (`Scheduler.init`); serve while the rest of
+/// the load runs; then the post-load lines and hooks, which a request that got the model waits for (`boot_gate`).
 pub fn serve(
     io: std.Io,
     allocator: std.mem.Allocator,
     /// Phase A1: model load happens on the scheduler's inference thread. The
     /// caller (main.zig) is responsible only for CPU-side setup (config parse,
     /// tokenizer load, EOS resolution, chat-template load); everything that
-    /// touches mlx is done by `Scheduler.init` before this fn proceeds.
+    /// touches mlx is done on the inference thread.
     load_params: model_load.LoadParams,
     config: *const model_mod.ModelConfig,
     host: []const u8,
@@ -1191,7 +1229,7 @@ pub fn serve(
     cfg: ServerConfig,
 ) !void {
     server_config = cfg;
-    // Before `Scheduler.init`: that call is the model load and every load-time bill inside it
+    // Before `Scheduler.init`: that call starts the model load and every load-time bill inside it
     // asks for the KV width.
     configured_kv_quant = if (load_params.kv_quant_explicit) load_params.kv_quant_config else null;
     defer configured_kv_quant = null;
@@ -1202,19 +1240,64 @@ pub fn serve(
 
     scheduler_mod.prefill_ubench_chunk = &requestPrefillChunkNow;
     defer scheduler_mod.prefill_ubench_chunk = null;
+
+    listen_host = host;
+    listen_port = port;
+    var listener: ?std.Io.net.Server = if (cfg.embedded_client != null) null else http_conn.startListener(host, port) catch |err| {
+        var msg_buf: [512]u8 = undefined;
+        if (startupRefusal(err, host, port, &msg_buf)) |msg| {
+            log.err("{s}\n", .{msg});
+            std.process.exit(1);
+        }
+        return err;
+    };
+    if (listener) |l| listen_port = l.socket.address.ip4.port;
+
+    const boots_model = !load_params.no_initial_load;
+    if (boots_model) boot_gate.process.begin();
+    defer if (!boot_gate.process.opened.isSet()) boot_gate.process.fail(io);
+
     // ── Phase A1: spin up the scheduler. Its inference thread does the
-    //    Transformer/vision/drafter load, JIT compile, and warmup before
-    //    `Scheduler.init` returns. From this point on, mlx ops are bound
-    //    to the inference thread's GPU stream.
-    var scheduler = try scheduler_mod.Scheduler.init(
+    //    Transformer/vision/drafter load, JIT compile, and warmup; mlx ops
+    //    are bound to that thread's GPU stream. `init` returns once the load
+    //    has passed its refusals, so a refusal still ends the boot unserved.
+    var scheduler = scheduler_mod.Scheduler.init(
         allocator,
         io,
         load_params,
         max_concurrent,
-    );
+    ) catch |err| {
+        if (listener) |*l| l.deinit(io);
+        return err;
+    };
     defer scheduler.deinit();
     global_scheduler = scheduler;
     defer global_scheduler = null;
+    global_registry = scheduler.registry;
+    defer global_registry = null;
+
+    if (instr.current() != null) {
+        startGaugeSampler() catch |err| log.err("metrics gauge sampler failed to start: {s}\n", .{@errorName(err)});
+        log.info("Prometheus metrics: ENABLED — GET http://{s}:{d}/metrics and /metrics.json\n", .{ host, port });
+    }
+    // Registered after the scheduler's deinit defer, so it runs first and the sampler never reads a freed scheduler.
+    defer stopGaugeSampler();
+
+    var client_thread: ?std.Thread = null;
+    defer if (listener) |*l| http_conn.closeEmbeddedListener(io, l, client_thread) else if (client_thread) |t| t.join();
+    var accept_thread: ?std.Thread = null;
+    defer stopServing(&accept_thread);
+    if (listener != null) {
+        log.info("\nServer listening on http://{s}:{d}\n", .{ host, listen_port });
+        if (boots_model) log.info("  {s} is loading: the page, /health, /v1/models, /props, /v1/settings and the metrics answer now; generation waits for the model\n", .{load_params.entry.id});
+        accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{ allocator, io, &listener.? });
+    }
+
+    scheduler.awaitStartupLoad() catch |err| {
+        boot_gate.process.fail(io);
+        return err;
+    };
+
     // The inference thread's evict-or-refuse hook (#353); the scheduler has no server import.
     scheduler_mod.prefill_admission_fits = &prefillFitsNow;
     defer scheduler_mod.prefill_admission_fits = null;
@@ -1247,14 +1330,6 @@ pub fn serve(
 
     usage_stats.global_store.loadDefault();
     defer usage_stats.global_store.storeDefault();
-
-    if (instr.current() != null) {
-        startGaugeSampler() catch |err| log.err("metrics gauge sampler failed to start: {s}\n", .{@errorName(err)});
-        log.info("Prometheus metrics: ENABLED — GET http://{s}:{d}/metrics and /metrics.json\n", .{ host, port });
-    }
-    // Registered after the scheduler's deinit defer, so it runs first and the sampler never reads a freed scheduler.
-    defer stopGaugeSampler();
-
     // Idle eviction (--idle-evict-secs). Same lifetime shape as the sampler,
     // and never in `Scheduler.deinit` — see `IdleEvictCtx.stop`.
     var idle_evict_thread: ?std.Thread = null;
@@ -1269,9 +1344,6 @@ pub fn serve(
     }
     defer if (idle_evict_thread) |t| t.join();
     defer idle_evict_stop.store(true, .monotonic);
-
-    global_registry = scheduler.registry;
-    defer global_registry = null;
 
     // Plan 05: the hot prefix cache lives on the LoadedModel
     // (entry.prefix_cache) and is set up by `loadModelOnInferenceThread`
@@ -1310,7 +1382,7 @@ pub fn serve(
     const verdict = if (startup_entry) |e| batchVerdictFor(e) else batchVerdictOf(config, false);
     log.info("Concurrency: --max-concurrent={d}, {s} (arch: {s})\n", .{ max_concurrent, concurrencyClause(verdict), config.model_type });
     if (verdict == .ok and prefix_cache_capacity > 0 and prefix_cache_capacity < max_concurrent) prefix_cache_capacity = max_concurrent;
-    // Install signal handlers for graceful shutdown
+    // Installed only now: until the load ends, a signal's default action ends the process mid-load.
     const sigact = std.posix.Sigaction{
         .handler = .{ .handler = signalHandler },
         .mask = std.posix.sigemptyset(),
@@ -1319,20 +1391,6 @@ pub fn serve(
     std.posix.sigaction(std.posix.SIG.INT, &sigact, null);
     std.posix.sigaction(std.posix.SIG.TERM, &sigact, null);
 
-    listen_host = host;
-    listen_port = port;
-    // Parse host address
-    var listener: ?std.Io.net.Server = if (cfg.embedded_client != null) null else http_conn.startListener(host, port) catch |err| {
-        var msg_buf: [512]u8 = undefined;
-        if (startupRefusal(err, host, port, &msg_buf)) |msg| {
-            log.err("{s}\n", .{msg});
-            std.process.exit(1);
-        }
-        return err;
-    };
-    var client_thread: ?std.Thread = null;
-    defer if (listener) |*l| http_conn.closeEmbeddedListener(io, l, client_thread) else if (client_thread) |t| t.join();
-    if (listener) |l| listen_port = l.socket.address.ip4.port;
     client_thread = if (server_config.on_ready) |ready| try ready(listen_port) else null;
 
     // Freeze the auto-context NOW, at startup, while the model is freshly
@@ -1389,7 +1447,6 @@ pub fn serve(
         log.info("MTP context ceiling: {d} tokens (--max-mtp-ctx; requests past it decode serially)\n", .{generate_mod.max_mtp_ctx});
     }
     if (listener != null) {
-        log.info("\nServer listening on http://{s}:{d}\n", .{ host, listen_port });
         if (g_api_key != null) {
             log.info("API key auth: ENABLED for non-loopback requests (localhost is trusted; /health and the chat page stay open)\n", .{});
         }
@@ -1408,7 +1465,7 @@ pub fn serve(
         log.info("  POST /tokenize\n", .{});
         log.info("  POST /detokenize\n\n", .{});
         var chat_url_buf: [96]u8 = undefined;
-        log.info("chat in your browser: {s}\n\n", .{chatPageUrl(&chat_url_buf, host, listen_port)});
+        log.info("chat in your browser: {s}chat\n\n", .{chatPageUrl(&chat_url_buf, host, listen_port)});
     }
 
     // Print system metrics once at startup
@@ -1425,9 +1482,25 @@ pub fn serve(
         });
     }
 
+    scheduler.releaseStartupPin();
+    boot_gate.process.open(io);
+
     if (cfg.embedded_client) |start| client_thread = try start();
 
-    // No listener: poll ignores a negative fd and sleeps out the timeout, so the loop still watches the shutdown flag.
+    if (accept_thread) |t| {
+        t.join();
+        accept_thread = null;
+    } else acceptLoop(allocator, io, null);
+    stopServing(&accept_thread);
+
+    responses_api.deinitGlobalResponseStore();
+
+    log.info("\nShutting down gracefully...\n", .{});
+}
+
+/// Accepts until shutdown, one detached thread per connection. With no listener (an embedded client) it only
+/// watches the shutdown flag: poll ignores a negative fd and sleeps out the timeout.
+fn acceptLoop(allocator: std.mem.Allocator, io: std.Io, listener: ?*std.Io.net.Server) void {
     var poll_fds = [_]std.posix.pollfd{.{
         .fd = if (listener) |l| l.socket.handle else -1,
         .events = std.posix.POLL.IN,
@@ -1480,31 +1553,32 @@ pub fn serve(
         // Detach: a joinable handle dropped per request leaks a stack region; no spawn site may discard its handle.
         conn_thread.detach();
     }
+}
 
-    // Shutdown ordering (prevents a SIGSEGV in Scheduler.complete): the accept
-    // loop has exited. Cancel every in-flight slot so its connection thread
-    // unblocks from waitNext and runs its `defer complete(...)`, then WAIT for
-    // all connection threads to finish before returning — `serve`'s caller runs
-    // `scheduler.deinit` on return, which frees the slot queues that an
-    // in-flight `complete()` is still touching. The inference thread is still
-    // alive here (deinit joins it only after we return), so cancelled slots
-    // settle promptly. Bounded so a wedged thread can't hang shutdown forever.
-    if (global_scheduler) |sch| sch.cancelAllInFlight();
-    {
-        var waited_ms: u64 = 0;
-        var idle_fds = [_]std.posix.pollfd{};
-        while (active_conn_threads.load(.acquire) > 0 and waited_ms < 30_000) {
-            _ = std.posix.poll(&idle_fds, 20) catch {}; // empty fd set → 20ms sleep
-            waited_ms += 20;
-        }
-        const remaining = active_conn_threads.load(.acquire);
-        if (remaining > 0)
-            log.warn("shutdown: {d} connection thread(s) still active after {d}ms — proceeding\n", .{ remaining, waited_ms });
+/// Shutdown ordering (prevents a SIGSEGV in Scheduler.complete): stop the accept
+/// loop, cancel every in-flight slot so its connection thread unblocks from
+/// waitNext and runs its `defer complete(...)`, then WAIT for all connection
+/// threads to finish — `serve` runs `scheduler.deinit` on return, which frees
+/// the slot queues that an in-flight `complete()` is still touching. The
+/// inference thread is still alive here (deinit joins it later), so cancelled
+/// slots settle promptly. Bounded so a wedged thread can't hang shutdown forever.
+/// Idempotent; also the cleanup of a boot whose load failed with the listener up.
+fn stopServing(accept_thread: *?std.Thread) void {
+    shutdown_requested.store(true, .release);
+    if (accept_thread.*) |t| {
+        t.join();
+        accept_thread.* = null;
     }
-
-    responses_api.deinitGlobalResponseStore();
-
-    log.info("\nShutting down gracefully...\n", .{});
+    if (global_scheduler) |sch| sch.cancelAllInFlight();
+    var waited_ms: u64 = 0;
+    var idle_fds = [_]std.posix.pollfd{};
+    while (active_conn_threads.load(.acquire) > 0 and waited_ms < 30_000) {
+        _ = std.posix.poll(&idle_fds, 20) catch {}; // empty fd set → 20ms sleep
+        waited_ms += 20;
+    }
+    const remaining = active_conn_threads.load(.acquire);
+    if (remaining > 0)
+        log.warn("shutdown: {d} connection thread(s) still active after {d}ms — proceeding\n", .{ remaining, waited_ms });
 }
 
 fn handleConnectionThread(args: *http_conn.ConnThreadArgs) void {
@@ -1615,8 +1689,9 @@ pub fn handleConnection(
     //    of the Responses API are pure registry/store reads — no model
     //    needed.
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
-        log.debug("GET  /health -> 200\n", .{});
-        try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
+        const health = boot_gate.process.health();
+        log.debug("GET  /health -> {s}\n", .{health.status});
+        try sendResponse(stream, health.status, "application/json", health.body);
         return;
     }
     // Prometheus scrape endpoint. 503 when --metrics is off. Behind the global
@@ -1642,7 +1717,11 @@ pub fn handleConnection(
             var sessions: [2 * instr.MAX_SESSIONS]instr.Session = undefined;
             var history: std.Io.Writer.Allocating = .init(allocator);
             defer history.deinit();
-            if (metrics_history.sinceParam(raw_path)) |since| try metrics_history.process.writeSince(stream.io, since, &history.writer);
+            if (metrics_history.sinceParam(raw_path)) |since| {
+                try metrics_history.process.writeSince(stream.io, since, &history.writer);
+                try history.writer.writeAll(",");
+                try m.finished.writeSince(stream.io, since, &history.writer);
+            }
             if (history.written().len > 0) try history.writer.writeAll(",");
             try history.writer.writeAll("\"usage\":");
             try usage_stats.global_store.writeJson(io_util.nowSecs(stream.io), .today, null, &history.writer);
@@ -1916,6 +1995,8 @@ pub fn handleConnection(
     // A status read must not look like use — see `isStatusRoute`.
     const status_read = http_conn.isStatusRoute(method, path);
     defer if (status_read) scheduler.releaseStatus(lm) else scheduler.release(lm);
+    // The launch model turns ready before its boot pins its context and installs the request hooks.
+    boot_gate.process.waitOpen(stream.io);
 
     // A model loaded on demand freezes its own auto-context here, for the same
     // reason the `--model` primary does at startup: the number we advertise is
@@ -3632,15 +3713,16 @@ fn diskContextForLoad(config: *model_mod.ModelConfig) u64 {
 pub fn prefixCacheDiskForLoad(config: *model_mod.ModelConfig, dir: []const u8, held: u64) ?disk_placement.DefaultDiskBudget {
     const kv_bits = defaultKvBits(config);
     const bpt = diskBytesPerToken(config, kv_bits);
-    const ctx = if (prefix_cache_disk_explicit) 0 else diskContextForLoad(config);
+    const ask = diskAsk();
+    const ctx = if (ask.explicit) 0 else diskContextForLoad(config);
     // An unreadable volume is no reason to refuse: the tier re-checks before every store.
     const free: u64 = if (disk_placement.volumeSpaceNear(dir)) |v| v.free else std.math.maxInt(u64);
     var buf: [384]u8 = undefined;
-    const plan = disk_placement.resolveDiskBudget(prefix_cache_disk_explicit, prefix_cache_disk_bytes, prefix_cache_capacity, ctx, bpt, free, held) orelse {
-        log.info("{s}\n", .{disk_placement.diskOffLine(&buf, free, dir)});
+    const plan = disk_placement.resolveDiskBudget(ask.explicit, ask.bytes, prefix_cache_capacity, ctx, bpt, free, held) orelse {
+        log.info("{s}\n", .{disk_placement.diskOffLine(&buf, free, dir, if (ask.explicit and ask.bytes == 0) ask.sourceName() else null)});
         return null;
     };
-    log.info("{s}\n", .{disk_placement.allocatingDiskLine(&buf, plan, prefix_cache_capacity, ctx, bpt, dir)});
+    log.info("{s}\n", .{disk_placement.allocatingDiskLine(&buf, plan, prefix_cache_capacity, ctx, bpt, dir, ask.sourceName())});
     return plan;
 }
 
@@ -4911,7 +4993,7 @@ test "an auto boot advertises the session the SSD-first budget floor was billed 
 test "the load-time session bill is billed at the boot's --kv-quant, not bf16" {
     // Live: the SSD-first budget billed the session at 22,464 MB with `--kv-quant 8` and with
     // `off` alike (dense 29,952 B/tok): `defaultKvBits` asked `global_scheduler`, which `serve`
-    // assigns only after `Scheduler.init` performs the load.
+    // assigns only after the load has run its preflight.
     const t = std.testing;
     var cfg = qwen4RequestTestConfig();
     cfg.mtp_override = false; // the MTP head's own term: `the load-time bill prices the MTP head ...`
@@ -6018,24 +6100,45 @@ pub fn archFlagRefusal(config: *const model_mod.ModelConfig, use: LaunchFlagUse)
     return null;
 }
 
+/// The facts `model_settings.applies` decides a key's reach from, so the settings API and the loader's ignored-key lines agree.
+pub fn settingsFit(config: *const model_mod.ModelConfig) model_settings.Fit {
+    const latent = config.isGlm5();
+    return .{
+        .arch = config.model_type,
+        .streams_experts = config.supportsExpertStreaming(),
+        .has_vision = config.has_vision,
+        .serves_mtp = !latent,
+        .streaming_required = config.expertStreamingRequired(),
+        .head_streams = expert_stream_mod.streamedMtpHeadSupported(config.isQwen4(), config.isDsv41(), config.expert_layout),
+        .stq_experts = if (config.dsv41) |c| c.expert_dec != null else false,
+        .latent_kv = latent,
+        .context_cap = config.contextCap(),
+    };
+}
+
 /// A model-settings.json `ssd_prefetch` on an arch with no expert prefetcher is ignored with this one line, as `kv_quant` is.
+/// A pack of the arch that has one but streams no STQ experts says so at its own load (`dsv41_serving`).
 pub fn settingsSsdPrefetchIgnoredLine(config: *const model_mod.ModelConfig) ?[]const u8 {
-    if (config.isDsv41() or config.ssd_prefetch_override == null) return null;
+    if (config.isDsv41() or model_settings.applies("ssd_prefetch", settingsFit(config)) or config.ssd_prefetch_override == null) return null;
     return "model-settings.json ssd_prefetch is ignored: this model has no expert prefetcher";
 }
 
 /// A model-settings.json `kv_quant` on an arch with no KV cache is ignored with this one line, never a refusal:
 /// the file outlives the flags that wrote it, and only an explicit launch flag is a request.
 pub fn settingsKvQuantIgnoredLine(config: *const model_mod.ModelConfig) ?[]const u8 {
-    if (!config.isDsv41() or config.kv_quant_override == null) return null;
+    if (model_settings.applies("kv_quant", settingsFit(config)) or config.kv_quant_override == null) return null;
     return "model-settings.json kv_quant is ignored on deepseek_v41 (no KV cache to quantize)";
 }
 
-/// A model-settings.json `mtp_acceptance` or `mtp_greedy_tail` on deepseek_v41 is ignored with this one line, as `kv_quant` is.
+/// A model-settings.json `mtp_acceptance` or `mtp_greedy_tail` where no MTP head runs is ignored with this one line, as `kv_quant` is.
 pub fn settingsMtpIgnoredLine(config: *const model_mod.ModelConfig) ?[]const u8 {
-    if (!config.isDsv41()) return null;
+    if (model_settings.applies("mtp_acceptance", settingsFit(config))) return null;
     const acceptance = config.mtp_acceptance_override != null;
     const tail = config.mtp_greedy_tail_override != null;
+    if (!config.isDsv41()) {
+        if (acceptance or tail) return "model-settings.json mtp_acceptance and mtp_greedy_tail are ignored: this load runs no MTP head";
+        return null;
+    }
     if (acceptance and tail) return "model-settings.json mtp_acceptance and mtp_greedy_tail are ignored on deepseek_v41 (DSpark accepts drafts by the exact rule only, with no MTP tail)";
     if (acceptance) return "model-settings.json mtp_acceptance is ignored on deepseek_v41 (DSpark accepts drafts by the exact rule only)";
     if (tail) return "model-settings.json mtp_greedy_tail is ignored on deepseek_v41 (DSpark has no MTP tail)";
@@ -7081,6 +7184,7 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn, 
         },
     };
     defer scheduler.release(lm);
+    boot_gate.process.waitOpen(stream.io);
     // Promotion happens only past ensureLoaded's error switch: a load that
     // FAILED must never steal the default from a model that answers.
     if (make_default) {
@@ -7108,9 +7212,9 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn, 
     defer allocator.free(drafter_path_json);
 
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"model":{{"id":"{s}","object":"model","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"drafter_loaded":{s},"drafter_path":{s}}}}}
+        \\{{"model":{{"id":{f},"object":"model","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"drafter_loaded":{s},"drafter_path":{s}}}}}
     , .{
-        model_id,
+        json_text.Str{ .s = model_id },
         bytes_resident,
         bytes_on_disk_str,
         if (drafter_loaded) "true" else "false",
@@ -7214,8 +7318,8 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn
 
     const id_for_body = if (requested_id.len > 0) requested_id else "sushi";
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"model":{{"id":"{s}","object":"model","loaded":false,"state":"unloaded"}}}}
-    , .{id_for_body});
+        \\{{"model":{{"id":{f},"object":"model","loaded":false,"state":"unloaded"}}}}
+    , .{json_text.Str{ .s = id_for_body }});
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -7672,10 +7776,12 @@ pub fn handleChatCompletions(
     }
 
     // Parse model name from request (use for response, fallback to config)
-    const model_name = if (root.get("model")) |v|
+    const model_name_raw = if (root.get("model")) |v|
         (if (v == .string) v.string else config.model_type)
     else
         config.model_type;
+    const model_name = try json_text.innerAlloc(allocator, model_name_raw);
+    defer allocator.free(model_name);
 
     // Track allocations from response_format injection so we can free them
     var rf_allocs = std.ArrayList([]const u8).empty;
@@ -8240,6 +8346,8 @@ const GaugeSamplerCtx = struct {
 fn sampleGauges(ctx: GaugeSamplerCtx) void {
     // System gauges (non-blocking syscalls).
     ctx.metrics.gpu_utilization_pct.set(@as(u64, metrics.getGpuPct()));
+    ctx.metrics.gpu_clock_mhz.set(gpu_clock_live.sampleMhz());
+    ctx.metrics.gpu_clock_max_mhz.set(gpu_clock_live.maxMhz());
     ctx.metrics.memory_mb.set(@as(u64, metrics.getAppMemFootprintMb()));
     // The two halves of the MLX allocator, so `memory_mb`'s gap has a name.
     var mlx_active: usize = 0;
@@ -8282,6 +8390,7 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
         .mlx_cache = mlx_cache,
         .memory_mb = @intCast(@min(ctx.metrics.memory_mb.load(), std.math.maxInt(u32))),
         .gpu_pct = @intCast(@min(ctx.metrics.gpu_utilization_pct.load(), 100)),
+        .gpu_mhz = @intCast(@min(ctx.metrics.gpu_clock_mhz.load(), std.math.maxInt(u16))),
         .running = @intCast(@min(running, std.math.maxInt(u16))),
         .waiting = @intCast(@min(waiting, std.math.maxInt(u16))),
         .prefilling = @intCast(@min(ctx.metrics.requests_prefilling.load(), std.math.maxInt(u16))),
@@ -12197,6 +12306,27 @@ test "deepseek_v41 ignores a model-settings mtp_acceptance or mtp_greedy_tail wi
     qwen4.mtp_acceptance_override = .{ .tokenv3 = 0.95 };
     qwen4.mtp_greedy_tail_override = true;
     try t.expect(settingsMtpIgnoredLine(&qwen4) == null);
+
+    var glm = model_mod.ModelConfig{ .model_type = "glm5_next" };
+    try t.expect(settingsMtpIgnoredLine(&glm) == null);
+    glm.mtp_greedy_tail_override = true;
+    try t.expect(std.mem.indexOf(u8, settingsMtpIgnoredLine(&glm).?, "mtp_greedy_tail are ignored: this load runs no MTP head") != null);
+}
+
+test "settingsFit: a latent-cache arch stores only the latent widths and serves no MTP head; the cap is the model's window" {
+    const t = std.testing;
+    var glm = model_mod.ModelConfig{ .model_type = "glm5_next", .max_position_embeddings = 131072 };
+    const fit = settingsFit(&glm);
+    try t.expect(fit.latent_kv and !fit.serves_mtp);
+    try t.expectEqual(@as(u32, 131072), fit.context_cap);
+    try t.expect(!model_settings.choiceAllowed("kv_quant", "4", fit));
+    try t.expect(model_settings.choiceAllowed("kv_quant", "6", fit));
+    const qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    try t.expect(!settingsFit(&qwen4).latent_kv and settingsFit(&qwen4).serves_mtp);
+    // A DSpark pack without STQ experts has no prefetcher, and says so at its own load.
+    var dsv41 = model_mod.ModelConfig{ .model_type = "deepseek_v41", .ssd_prefetch_override = 30 };
+    try t.expect(!model_settings.applies("ssd_prefetch", settingsFit(&dsv41)));
+    try t.expect(settingsSsdPrefetchIgnoredLine(&dsv41) == null);
 }
 
 test "--ssd-prefetch is refused where there is no expert prefetcher, before the weights load, and its model setting is ignored there" {

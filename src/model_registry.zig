@@ -32,6 +32,7 @@ const model_settings = @import("model_settings.zig");
 const io_util = @import("io_util.zig");
 const generate_mod = @import("generate.zig");
 const log = @import("log.zig");
+const pack_update = @import("pack_update.zig");
 
 /// Bumped every time a model becomes `.ready`; readers compare against the value they last acted on.
 pub var load_generation = std.atomic.Value(u64).init(0);
@@ -194,6 +195,8 @@ pub const LoadedModel = struct {
     /// Approximate weight bytes on disk (sum of *.safetensors). Used for
     /// pre-load eviction estimates so we don't oversubscribe wired memory.
     bytes_on_disk: ?u64,
+    /// Part of `bytes_on_disk` read through symlinks to files outside the pack folder.
+    bytes_linked: u64 = 0,
     /// `model_type` peeked from config.json at discovery time (allocator-
     /// owned dupe; empty when unknown). Lets /v1/models advertise
     /// arch-derived capabilities while the entry is still an `.unloaded` stub.
@@ -543,6 +546,7 @@ pub const ModelStatus = struct {
     loaded: bool,
     bytes_resident: u64,
     bytes_on_disk: ?u64,
+    bytes_linked: u64 = 0,
     last_used_ns: i64,
     state: []const u8,
     error_name: ?[]const u8,
@@ -557,6 +561,17 @@ pub const ModelStatus = struct {
         };
     }
 };
+
+/// The roots a rescan walks: the boot roots plus the settings file's models directory, unless a launch flag pins them.
+fn rootsWithFileDir(buf: *[9][]const u8, boot_roots: []const []const u8, pinned: bool, file_dir: ?[]const u8) []const []const u8 {
+    if (pinned) return boot_roots;
+    const dir = file_dir orelse return boot_roots;
+    if (boot_roots.len >= buf.len) return boot_roots;
+    for (boot_roots) |r| if (std.mem.eql(u8, r, dir)) return boot_roots;
+    @memcpy(buf[0..boot_roots.len], boot_roots);
+    buf[boot_roots.len] = dir;
+    return buf[0 .. boot_roots.len + 1];
+}
 
 /// Registry of all discovered + loaded models. One instance per server.
 ///
@@ -580,6 +595,9 @@ pub const ModelRegistry = struct {
     /// holds one synthetic entry for the loaded model so the rest of the
     /// API works uniformly.
     discovery: ?model_discovery.DiscoveryResult,
+
+    /// The settings file `rescan` reads; null is `~/.sushi/model-settings.json`. Borrowed.
+    settings_path: ?[]const u8 = null,
 
     /// Map of id → entry. Keys are borrowed from `LoadedModel.id`; entries
     /// are heap-allocated and owned by the registry. Iteration order isn't
@@ -669,7 +687,8 @@ pub const ModelRegistry = struct {
         if (discovery) |d| {
             errdefer self.deinitInternal();
             for (d.models) |m| {
-                _ = try self.registerStubWithMeta(m.id, m.path, m.bytes_on_disk, m.model_type, m.streaming_index_complete);
+                const stub = try self.registerStubWithMeta(m.id, m.path, m.bytes_on_disk, m.model_type, m.streaming_index_complete);
+                stub.bytes_linked = m.bytes_linked;
             }
         }
 
@@ -784,6 +803,7 @@ pub const ModelRegistry = struct {
         // Re-check under the lock — another conn thread may have raced us.
         if (self.entries.get(base)) |existing| return existing.id;
         const stub = try self.registerStubWithMeta(base, trimmed, probe.bytes_on_disk, probe.model_type, streaming_index_complete);
+        stub.bytes_linked = probe.bytes_linked;
         return stub.id;
     }
 
@@ -843,25 +863,22 @@ pub const ModelRegistry = struct {
     /// can't see them). Add-only: an id or path already registered wins
     /// (first-wins, like boot) and live entries are never re-pointed or
     /// removed. A failed load at the same path becomes retryable. Returns the
-    /// number of stubs added. No roots (a `--model`-only
-    /// server) rescans nothing.
+    /// number of stubs added. A `--model`-only server with no
+    /// settings-file models directory rescans nothing.
     pub fn rescan(self: *ModelRegistry) !u32 {
-        const boot_roots = if (self.discovery) |d| d.roots else &.{};
-        if (boot_roots.len == 0) return 0;
-        // The settings file's models directory joins the boot roots, so a changed one is found without a restart.
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        var file = model_settings.load(self.allocator, self.io, model_settings.defaultPath(&path_buf));
+        return self.rescanWithSettings(self.settings_path orelse model_settings.defaultPath(&path_buf));
+    }
+
+    /// `rescan` reading the settings file at `settings_path`.
+    pub fn rescanWithSettings(self: *ModelRegistry, settings_path: []const u8) !u32 {
+        const boot_roots = if (self.discovery) |d| d.roots else &.{};
+        // The settings file's models directory joins the boot roots, so a changed one is found without a restart.
+        var file = model_settings.load(self.allocator, self.io, settings_path);
         defer file.deinit();
         var with_file: [9][]const u8 = undefined;
-        const roots = blk: {
-            if (model_settings.launch_locks.models_dir.set) break :blk boot_roots;
-            const dir = model_settings.server(&file).models_dir orelse break :blk boot_roots;
-            if (boot_roots.len >= with_file.len) break :blk boot_roots;
-            for (boot_roots) |r| if (std.mem.eql(u8, r, dir)) break :blk boot_roots;
-            @memcpy(with_file[0..boot_roots.len], boot_roots);
-            with_file[boot_roots.len] = dir;
-            break :blk with_file[0 .. boot_roots.len + 1];
-        };
+        const roots = rootsWithFileDir(&with_file, boot_roots, model_settings.launch_locks.models_dir.set, model_settings.server(&file).models_dir);
+        if (roots.len == 0) return 0;
         var found = try model_discovery.discoverModelsMany(self.io, self.allocator, roots);
         defer found.deinit();
         var added: u32 = 0;
@@ -872,11 +889,13 @@ pub const ModelRegistry = struct {
                 if (e.state == .error_state and std.mem.eql(u8, e.path, m.path)) {
                     self.markUnloadedLocked(e);
                     e.bytes_on_disk = m.bytes_on_disk;
+                    e.bytes_linked = m.bytes_linked;
                 }
                 continue;
             }
             if (self.peekByPathLocked(m.path) != null) continue;
-            _ = try self.registerStubWithMeta(m.id, m.path, m.bytes_on_disk, m.model_type, m.streaming_index_complete);
+            const stub = try self.registerStubWithMeta(m.id, m.path, m.bytes_on_disk, m.model_type, m.streaming_index_complete);
+            stub.bytes_linked = m.bytes_linked;
             added += 1;
         }
         return added;
@@ -911,13 +930,13 @@ pub const ModelRegistry = struct {
     /// set. The returned pointer is borrowed; valid for the registry's
     /// lifetime.
     pub fn resolveEntry(self: *ModelRegistry, id_or_empty: []const u8) !*LoadedModel {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const id = if (id_or_empty.len == 0 or std.mem.eql(u8, id_or_empty, "sushi"))
             self.default_id
         else
             id_or_empty;
         if (id.len == 0) return error.NoDefaultModel;
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
         return self.entries.get(id) orelse error.UnknownModelId;
     }
 
@@ -974,6 +993,17 @@ pub const ModelRegistry = struct {
         _ = entry.refcount.fetchAdd(1, .acq_rel);
         entry.memory_context_refusal = null;
         self.state_cond.broadcast(self.io);
+        return true;
+    }
+
+    /// The launch model's load, claimed before the listener accepts, the way a cold load claims its own: it lists
+    /// `loading`, a request for it waits in `ensureLoaded` instead of starting a second load, and its estimate counts in
+    /// another model's eviction gate. The caller holds the claim's reference until its boot is done.
+    pub fn claimStartupLoad(self: *ModelRegistry, entry: *LoadedModel, estimated: u64) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.tryBeginLoadLocked(entry)) return false;
+        self.reserveLoadLocked(entry, estimated);
         return true;
     }
 
@@ -1138,6 +1168,7 @@ pub const ModelRegistry = struct {
         self.releaseReservationLocked(entry); // pending estimate → actual residency
         entry.bytes_resident = bytes_resident;
         entry.state = .ready;
+        pack_update.watch(entry.path);
         entry.memory_context_refusal = null;
         entry.error_name = null;
         self.lru_clock += 1;
@@ -1252,7 +1283,7 @@ pub const ModelRegistry = struct {
     /// (2026-08-08). Merge note: this arm came from the branch's
     /// `scheduler.loadErrorFor`, which this function replaced — the name-based
     /// half survived the refactor, the second name did not.
-    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, ArchitectureUnsupported, ModelFormatUnsupported, ExpertCacheDoesNotFit, ExpertStreamingRequired, SsdBudgetBelowResident, SsdBudgetBelowVision, SsdBudgetExceedsWiredLimit, ExpertStreamingMtpUnsupported, ExpertStreamingUnsupportedLayout, ExpertSlabImportCopied, ExpertLayoutUnsupported, Exl3TopKExceedsReduceBank, Exl3TrellisGeometry, Exl3WindowUnsupported, Exl3ShardStampMismatch, Exl3TileOrderUnsupported, Exl3TileOrderMixed, Exl3TileOrderMismatch, Exl3TileOrderNeedsGroups, Exl3RateGroupsStreamingUnsupported, Exl3GateUpRateMismatch, Exl3CodebookTableUnknown, Exl3CodebookTableDigestMismatch, Exl3CodebookTableWindowMismatch, Exl3CodebookTableCodebookMismatch, Exl3CodebookTableRateMissing, Exl3CodebookTableLegacyConfig, Exl3CodebookTableUndecodable } {
+    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, ArchitectureUnsupported, ModelFormatUnsupported, ExpertCacheDoesNotFit, ExpertStreamingRequired, SsdBudgetBelowResident, SsdBudgetBelowVision, SsdBudgetExceedsWiredLimit, ExpertStreamingMtpUnsupported, ExpertStreamingUnsupportedLayout, ExpertSlabImportCopied, ExpertLayoutUnsupported, Exl3TopKExceedsReduceBank, Exl3TrellisGeometry, Exl3WindowUnsupported, Exl3ShardStampMismatch, Exl3TileOrderUnsupported, Exl3TileOrderMixed, Exl3TileOrderMismatch, Exl3TileOrderNeedsGroups, Exl3RateGroupsStreamingUnsupported, Exl3GateUpRateMismatch, Exl3CodebookTableUnknown, Exl3CodebookTableDigestMismatch, Exl3CodebookTableWindowMismatch, Exl3CodebookTableCodebookMismatch, Exl3CodebookTableRateMissing, Exl3CodebookTableLegacyConfig, Exl3CodebookTableUndecodable, PackRevisionMixed } {
         if (name) |n| {
             if (std.mem.eql(u8, n, "InsufficientMemory")) return error.InsufficientMemory;
             if (std.mem.eql(u8, n, "ArchitectureUnsupported")) return error.ArchitectureUnsupported;
@@ -1284,6 +1315,7 @@ pub const ModelRegistry = struct {
             if (std.mem.eql(u8, n, "Exl3CodebookTableRateMissing")) return error.Exl3CodebookTableRateMissing;
             if (std.mem.eql(u8, n, "Exl3CodebookTableLegacyConfig")) return error.Exl3CodebookTableLegacyConfig;
             if (std.mem.eql(u8, n, "Exl3CodebookTableUndecodable")) return error.Exl3CodebookTableUndecodable;
+            if (std.mem.eql(u8, n, "PackRevisionMixed")) return error.PackRevisionMixed;
         }
         return error.LoadFailed;
     }
@@ -1312,6 +1344,7 @@ pub const ModelRegistry = struct {
         try std.testing.expectEqual(error.Exl3ShardStampMismatch, loadErrorFromName("Exl3ShardStampMismatch"));
         try std.testing.expectEqual(error.Exl3TileOrderUnsupported, loadErrorFromName("Exl3TileOrderUnsupported"));
         try std.testing.expectEqual(error.Exl3TileOrderMixed, loadErrorFromName("Exl3TileOrderMixed"));
+        try std.testing.expectEqual(error.PackRevisionMixed, loadErrorFromName("PackRevisionMixed"));
         try std.testing.expectEqual(error.Exl3TileOrderMismatch, loadErrorFromName("Exl3TileOrderMismatch"));
         try std.testing.expectEqual(error.Exl3TileOrderNeedsGroups, loadErrorFromName("Exl3TileOrderNeedsGroups"));
         try std.testing.expectEqual(error.Exl3CodebookTableUnknown, loadErrorFromName("Exl3CodebookTableUnknown"));
@@ -1404,6 +1437,7 @@ pub const ModelRegistry = struct {
                 .loaded = entry.state == .ready,
                 .bytes_resident = entry.bytes_resident,
                 .bytes_on_disk = entry.bytes_on_disk,
+                .bytes_linked = entry.bytes_linked,
                 .last_used_ns = entry.last_used_ns,
                 .state = ModelStatus.stateName(entry.state),
                 .error_name = entry.error_name,
@@ -1785,6 +1819,69 @@ test "ModelRegistry: ensureLoaded reports error_state" {
     try testing.expectEqualStrings("MissingVisionWeights", stub.error_name.?);
 }
 
+const StartupWaiter = struct {
+    reg: *ModelRegistry,
+    got: ?anyerror!*LoadedModel = null,
+    done: std.atomic.Value(bool) = .init(false),
+    fn run(self: *@This()) void {
+        self.got = self.reg.ensureLoaded("");
+        self.done.store(true, .release);
+    }
+    fn stillWaiting(self: *@This()) bool {
+        for (0..50) |_| {
+            if (self.done.load(.acquire)) return false;
+            const ts = std.c.timespec{ .sec = 0, .nsec = 1_000_000 };
+            _ = std.c.nanosleep(&ts, null);
+        }
+        return !self.done.load(.acquire);
+    }
+};
+
+test "ModelRegistry: a launch model claimed for its startup load lists loading, and a request waits for it" {
+    var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
+    defer reg.deinit();
+    const e = try reg.registerStub("launch", "/path/to/launch", 1024);
+    try reg.setDefault("launch");
+    try testing.expect(reg.claimStartupLoad(e, 4096));
+    try testing.expect(!reg.claimStartupLoad(e, 4096));
+    const snap = try reg.snapshot(testing.allocator);
+    defer testing.allocator.free(snap);
+    try testing.expectEqualStrings("loading", snap[0].state);
+    try testing.expectEqual(@as(u64, 4096), reg.reserved_bytes);
+
+    var w: StartupWaiter = .{ .reg = reg };
+    const t = try std.Thread.spawn(.{}, StartupWaiter.run, .{&w});
+    try testing.expect(w.stillWaiting());
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markReadyLocked(e, 1000);
+    reg.mutex.unlock(reg.io);
+    t.join();
+    try testing.expectEqual(e, try w.got.?);
+    try testing.expectEqual(@as(u64, 0), reg.reserved_bytes);
+    try testing.expectEqual(@as(u32, 2), e.refcount.load(.acquire));
+    reg.release(e);
+    reg.releaseStatus(e);
+    try testing.expectEqual(@as(u32, 0), e.refcount.load(.acquire));
+}
+
+test "ModelRegistry: a startup load that fails reaches the waiting request by name" {
+    var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
+    defer reg.deinit();
+    const e = try reg.registerStub("launch", "/path/to/launch", 1024);
+    try reg.setDefault("launch");
+    try testing.expect(reg.claimStartupLoad(e, 4096));
+    var w: StartupWaiter = .{ .reg = reg };
+    const t = try std.Thread.spawn(.{}, StartupWaiter.run, .{&w});
+    try testing.expect(w.stillWaiting());
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markErrorLocked(e, "InsufficientMemory");
+    reg.mutex.unlock(reg.io);
+    t.join();
+    try expectError(error.InsufficientMemory, w.got.?);
+    try testing.expectEqual(@as(u64, 0), reg.reserved_bytes);
+    reg.releaseStatus(e);
+}
+
 test "ModelRegistry: memory-refused loads keep their identity, other failures expose their name" {
     var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
     defer reg.deinit();
@@ -2164,6 +2261,23 @@ test "ModelRegistry: first chat-capable ready load becomes the default on a head
     chat2.config = null;
 }
 
+/// Rescan tests never read the user's own settings file, whose models folder would join the roots.
+const no_settings = "/nonexistent/sushi-test/model-settings.json";
+
+test "ModelRegistry: rescan roots: the settings file's models directory is walked even on a --model-only server" {
+    var buf: [9][]const u8 = undefined;
+    const only_file = rootsWithFileDir(&buf, &.{}, false, "/models");
+    try testing.expectEqual(@as(usize, 1), only_file.len);
+    try testing.expectEqualStrings("/models", only_file[0]);
+    try testing.expectEqual(@as(usize, 0), rootsWithFileDir(&buf, &.{}, false, null).len);
+
+    const boot = [_][]const u8{"/boot"};
+    const both = rootsWithFileDir(&buf, &boot, false, "/models");
+    try testing.expectEqual(@as(usize, 2), both.len);
+    try testing.expectEqual(@as(usize, 1), rootsWithFileDir(&buf, &boot, true, "/models").len);
+    try testing.expectEqual(@as(usize, 1), rootsWithFileDir(&buf, &boot, false, "/boot").len);
+}
+
 test "ModelRegistry: rescan absorbs newly downloaded dirs as stubs (add-only, idempotent)" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -2187,13 +2301,61 @@ test "ModelRegistry: rescan absorbs newly downloaded dirs as stubs (add-only, id
     try tmp.dir.writeFile(io, .{ .sub_path = "org/second/config.json", .data = "{\"model_type\":\"mimo_v2\"}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "org/second/model.safetensors", .data = "0123" });
 
-    try testing.expectEqual(@as(u32, 1), try reg.rescan());
+    try testing.expectEqual(@as(u32, 1), try reg.rescanWithSettings(no_settings));
     const stub = reg.peek("org/second") orelse return error.TestExpectedResult;
     try testing.expectEqualStrings("mimo_v2", stub.arch_hint);
     try testing.expectEqual(LoadState.unloaded, stub.state);
     // Idempotent: nothing new on disk, nothing added, the boot entry untouched.
-    try testing.expectEqual(@as(u32, 0), try reg.rescan());
+    try testing.expectEqual(@as(u32, 0), try reg.rescanWithSettings(no_settings));
     try testing.expect(reg.peek("org/first") != null);
+}
+
+test "ModelRegistry: rescan reads the settings file the registry names instead of the home one" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    try tmp.dir.createDirPath(io, "models/org/m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/org/m/config.json", .data = "{\"model_type\":\"glm5_next\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/org/m/model.safetensors", .data = "0123" });
+    const settings_json = try std.fmt.allocPrint(testing.allocator, "{{\"server\":{{\"models_dir\":\"{s}/models\"}}}}", .{root});
+    defer testing.allocator.free(settings_json);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-settings.json", .data = settings_json });
+    const settings = try std.fmt.allocPrint(testing.allocator, "{s}/model-settings.json", .{root});
+    defer testing.allocator.free(settings);
+
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+    reg.settings_path = settings;
+    try testing.expectEqual(@as(u32, 1), try reg.rescan());
+    try testing.expect(reg.peek("org/m") != null);
+    reg.settings_path = no_settings;
+    try testing.expectEqual(@as(u32, 0), try reg.rescan());
+}
+
+test "ModelRegistry: rescan under a models root never absorbs test-fixtures or dot folders" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    try tmp.dir.createDirPath(io, "org/first");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/first/config.json", .data = "{\"model_type\":\"glm5_next\"}" });
+    const discovery = try model_discovery.discoverModelsMany(io, testing.allocator, &.{root});
+    var reg = try ModelRegistry.init(testing.allocator, io, discovery, 3, 0, null);
+    defer reg.deinit();
+
+    try model_discovery.writePackStub(io, tmp.dir, "test-fixtures/x");
+    try model_discovery.writePackStub(io, tmp.dir, ".hidden/y");
+    try model_discovery.writePackStub(io, tmp.dir, "org/second");
+
+    try testing.expectEqual(@as(u32, 1), try reg.rescanWithSettings(no_settings));
+    try testing.expect(reg.peek("org/second") != null);
+    try testing.expect(reg.peek("x") == null);
+    try testing.expect(reg.peek("y") == null);
 }
 
 test "upstream bugfix: ModelRegistry: rescan clears a failed load so the completed dir can load again" {
@@ -2232,13 +2394,38 @@ test "upstream bugfix: ModelRegistry: rescan clears a failed load so the complet
     // The download finishes after the failed load.
     try tmp.dir.writeFile(io, .{ .sub_path = "org/broken/model.safetensors", .data = "01234567" });
 
-    try testing.expectEqual(@as(u32, 0), try reg.rescan());
+    try testing.expectEqual(@as(u32, 0), try reg.rescanWithSettings(no_settings));
     try testing.expectEqual(LoadState.unloaded, broken.state);
     try testing.expectEqual(@as(?[]const u8, null), broken.error_name);
     try testing.expectEqual(@as(?u64, 8), broken.bytes_on_disk);
     try testing.expectEqual(LoadState.loading, fine.state);
     try testing.expectEqual(LoadState.error_state, moved.state);
     try testing.expectEqual(@as(?u64, 4), fine.bytes_on_disk);
+    try testing.expectEqual(@as(u64, 0), broken.bytes_linked);
+}
+
+test "discovered bytes_linked reaches the registry entry and its snapshot" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "elsewhere");
+    try tmp.dir.writeFile(io, .{ .sub_path = "elsewhere/x.safetensors", .data = "01234567" });
+    try tmp.dir.createDirPath(io, "org/linked");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/linked/config.json", .data = "{\"model_type\":\"qwen4_exp\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/linked/own.safetensors", .data = "0123" });
+    try tmp.dir.symLink(io, "../../elsewhere/x.safetensors", "org/linked/x.safetensors", .{});
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    const discovery = try model_discovery.discoverModelsMany(io, testing.allocator, &.{root});
+    var reg = try ModelRegistry.init(testing.allocator, io, discovery, 3, 0, null);
+    defer reg.deinit();
+    const e = reg.peek("org/linked") orelse return error.TestExpectedResult;
+    try testing.expectEqual(@as(?u64, 12), e.bytes_on_disk);
+    try testing.expectEqual(@as(u64, 8), e.bytes_linked);
+    const snap = try reg.snapshot(testing.allocator);
+    defer testing.allocator.free(snap);
+    try testing.expectEqual(@as(u64, 8), snap[0].bytes_linked);
 }
 
 

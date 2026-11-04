@@ -1,0 +1,915 @@
+// sushi-test: tier=hermetic needs=node,playwright
+// The Models and Settings tabs in a real headless browser against a stubbed server: no sushi server, no model.
+// Needs Playwright with a Chromium build (global or local install); skips without one.
+const fs = require('node:fs');
+const path = require('node:path');
+const { execSync } = require('node:child_process');
+const assert = require('node:assert/strict');
+
+function loadPlaywright() {
+  const roots = [undefined];
+  try { roots.push(path.join(execSync('npm root -g', { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim(), 'playwright')); } catch {}
+  for (const root of roots) {
+    try { return require(root ?? 'playwright'); } catch {}
+  }
+  return null;
+}
+
+const html = fs.readFileSync('src/webui/index.html', 'utf8');
+const ORIGIN = 'http://sushi.test';
+const GiB = 2 ** 30;
+const KEYS = [
+  { name: 'ctx_size', type: 'int', min: 1, max: 4294967295 }, { name: 'kv_quant', type: 'choice', choices: ['off', '4', '6', '8'] },
+  { name: 'mtp', type: 'bool' }, { name: 'mtp_acceptance', type: 'choice', choices: ['exact', 'typical', 'tokenv3'] }, { name: 'mtp_greedy_tail', type: 'bool' },
+  { name: 'ssd_budget_gb', type: 'int', min: 1, max: 512 }, { name: 'ssd_prefetch', type: 'int', min: 0, max: 100 },
+  { name: 'preserve_thinking', type: 'bool' }, { name: 'think_penalty', type: 'number', min: 0, max: 20 }, { name: 'vision', type: 'bool' },
+];
+const keyState = (extra = {}) => ({ file: null, flag: null, source: 'default', locked: false, ...extra });
+const BASE_KEYS = ['ctx_size', 'kv_quant', 'mtp', 'mtp_acceptance', 'mtp_greedy_tail', 'preserve_thinking', 'think_penalty'];
+const allKeys = (over = {}) => Object.fromEntries(KEYS.map((k) => [k.name, over[k.name] ?? keyState()]));
+
+// A stub server: its state lives here in node, every call is recorded, and a test can hold a response back.
+function makeServer(opts = {}) {
+  const calls = [];
+  const gates = {};
+  const state = {
+    failSettings: 0, loadDelay: null, settingsDelay: [], loadFails: false, down: false, hooks: {},
+    models: [
+      { id: 'Qwen-A', state: 'ready', bytes_on_disk: 38 * GiB, bytes_resident: 40 * GiB, context_length: 262144, input_modalities: ['text', 'image'], keys: [...BASE_KEYS, 'vision'], settings: allKeys({ ctx_size: keyState({ file: 65536, source: 'file' }), kv_quant: keyState({ flag: '8', source: 'flag', locked: true }) }) },
+      { id: 'GLM-B', state: 'unloaded', bytes_on_disk: 61 * GiB, context_length: 131072, input_modalities: ['text'], keys: BASE_KEYS, settings: allKeys({ kv_quant: keyState({ file: 'off', source: 'file' }) }) },
+      { id: 'Deep-C', state: 'unloaded', bytes_on_disk: 96 * GiB, bytes_linked: 40 * GiB, pack_update: { current: '1.0', latest: '2.0', command: 'sushi pull deepseek-v4.1-flash' }, streaming: true, context_length: 131072, input_modalities: ['text'], keys: [...BASE_KEYS, 'ssd_budget_gb', 'ssd_prefetch'], settings: allKeys() },
+      { id: 'Broke-D', state: 'error_state', bytes_on_disk: 20 * GiB, context_length: 8192, input_modalities: ['text'], keys: BASE_KEYS, settings: allKeys() },
+    ],
+    server: {
+      models_dir: { default: '/h/.sushi/models', boot_roots: ['/models'], file: null, flag: '', source: 'default', locked: !!opts.dirLocked, applies: 'models are rescanned at once' },
+      prefix_cache_disk_gb: { file: 100, flag: null, source: 'file', locked: false, effective_bytes: 100 * GiB, ask_bytes: 100 * GiB, applies: 'a running tier takes a new size at once and evicts down to it; 0 (off) and removing the key apply at the next load' },
+    },
+    cache: {
+      root: '/h/.sushi/kv-cache', volume: { free_bytes: 1399 * GiB, total_bytes: 3722 * GiB }, total_bytes: 71.5 * GiB,
+      namespaces: [
+        { id: 'aaaaaaaa11111111', bytes: Math.round(41.2 * GiB), entries: 37, newest_mtime: Date.now() / 1000 - 2 * 86400, model: 'Qwen-A', stale: false, held_by_other_process: false, tier: { used_bytes: 41 * GiB, cap_bytes: 100 * GiB, entries: 37, written_bytes: 5 * GiB } },
+        { id: 'bbbbbbbb22222222', bytes: Math.round(22.1 * GiB), entries: 9, newest_mtime: Date.now() / 1000 - 3 * 86400, model: null, stale: true, held_by_other_process: false, tier: null },
+        { id: 'cccccccc33333333', bytes: Math.round(8.2 * GiB), entries: 3, newest_mtime: Date.now() / 1000 - 7200, model: null, stale: false, held_by_other_process: true, tier: null },
+      ],
+    },
+  };
+  const modelsBody = () => ({ data: state.models.map((m) => ({ id: m.id, object: 'model', loaded: m.state === 'ready', state: m.state === 'error_state' ? 'error' : m.state, bytes_resident: m.bytes_resident ?? 0, bytes_on_disk: m.bytes_on_disk, bytes_linked: m.bytes_linked ?? 0, streaming: !!m.streaming, streaming_required: !!m.streaming_required, ssd_budget_gb: m.ssd_budget_gb, context_length: m.context_length, input_modalities: m.input_modalities, capabilities: ['chat'], meta: { architecture: 'qwen4_exp', quantization: '2.75-bit', ...(m.pack_update ? { pack_update: m.pack_update } : {}) } })) });
+  const settingsBody = () => ({ file: '/h/.sushi/model-settings.json', applies: 'next load of the model', model_keys: KEYS, server: state.server,
+    models: state.models.map((m) => ({ id: m.id, path: `/models/${m.id}`, state: m.state, bytes_on_disk: m.bytes_on_disk, settings: m.settings, keys: m.keys, loaded_with: m.loaded_with ?? null, ...(opts.limits && m.limits ? { limits: m.limits } : {}) })) });
+  if (opts.limits) {
+    state.models[0].limits = { ctx_size: { max: 131072, why: "This model's context window is 131072 tokens." }, kv_quant: { choices: ['off', '8'], why: '4-bit and 6-bit need a different cache layout.' },
+      mtp_acceptance: { requires: { mtp: true }, why: 'Used only while MTP is on.' }, mtp_greedy_tail: { requires: { mtp: true }, why: 'Used only while MTP is on.' } };
+    state.models[2].keys = ['ctx_size', 'mtp', 'ssd_budget_gb', 'ssd_prefetch', 'think_penalty', 'vision'];
+    state.models[2].limits = { kv_quant: { disabled: true, why: 'This model keeps no KV cache to quantize.' }, preserve_thinking: { disabled: true, why: 'No preserve-thinking switch in this chat template.' },
+      mtp: { unset: ['ssd_budget_gb'], why: 'An SSD budget makes this model stream its experts, and its MTP head cannot run while they stream.' } };
+  }
+  const json = (body, status = 200) => ({ status, contentType: 'application/json', body: JSON.stringify(body) });
+  const hold = (name) => new Promise((resolve) => { gates[name] = resolve; });
+  async function handle(route) {
+    const request = route.request(), url = new URL(request.url()), p = url.pathname, method = request.method();
+    if (/^\/(chat|dashboard|models|settings)?$/.test(p)) return route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: html });
+    const body = method === 'POST' ? JSON.parse(request.postData() || '{}') : null;
+    calls.push({ path: p, method, body, auth: request.headers().authorization });
+    if (state.down) return route.abort('failed');
+    const hook = state.hooks[p];
+    if (hook) { const answer = await hook(body, method); if (answer) return route.fulfill(answer); }
+    switch (p) {
+      case '/v1/models': return route.fulfill(json(modelsBody()));
+      case '/v1/settings':
+        if (method === 'POST') {
+          const m = state.models.find((x) => x.id === body.model);
+          if (opts.limits && body.set && 'think_penalty' in body.set) return route.fulfill(json({ error: { message: 'think_penalty is not supported by this model' } }, 400));
+          for (const [k, v] of Object.entries(body.set ?? {})) if (m) m.settings[k] = keyState({ file: v, source: v === null ? 'default' : 'file' });
+          for (const [k, v] of Object.entries(body.server ?? {})) { state.server[k] = { ...state.server[k], file: v, source: v === null ? 'default' : 'file' }; if (k === 'prefix_cache_disk_gb') state.server[k].effective_bytes = state.server[k].ask_bytes = (v ?? 20) * GiB; }
+          const cacheNote = body.server?.prefix_cache_disk_gb ? 'applied to the running tiers' : 'saved; applies at the next model load';
+          return route.fulfill(json({ applied: Object.fromEntries(Object.keys(body.set ?? body.server ?? {}).map((k) => [k, k === 'prefix_cache_disk_gb' ? cacheNote : 'saved'])), model_loaded: m?.state === 'ready' }));
+        }
+        if (state.failSettings > 0) { state.failSettings -= 1; return route.fulfill({ status: 500, contentType: 'text/html', body: '<html><body><h1>Bad gateway</h1></body></html>' }); }
+        { const answer = json(settingsBody()); if (state.settingsDelay.length) await state.settingsDelay.shift(); return route.fulfill(answer); }
+      case '/v1/prefix-cache': return route.fulfill(json(state.cache));
+      case '/v1/prefix-cache/clear': {
+        if (body.scope === 'namespace') { const n = state.cache.namespaces.find((x) => x.id === body.id); state.cache.namespaces = state.cache.namespaces.filter((x) => x !== n); return route.fulfill(json({ stale_namespaces_removed: 1, stale_freed_bytes: n.bytes, skipped_live_namespaces: 0, refused_symlinks: 0 })); }
+        const freed = body.scope === 'stale' ? state.cache.namespaces.filter((n) => n.stale).reduce((a, n) => a + n.bytes, 0) : 123;
+        if (body.scope === 'stale') state.cache.namespaces = state.cache.namespaces.filter((n) => !n.stale);
+        return route.fulfill(json({ freed_bytes: freed }));
+      }
+      case '/v1/load-model': {
+        if (state.loadDelay) await state.loadDelay;
+        const m = state.models.find((x) => x.id === body.model);
+        if (state.loadFails) return route.fulfill(json({ error: { message: 'out of memory: needs 61 GiB' } }, 503));
+        m.state = 'ready'; m.bytes_resident = m.bytes_on_disk;
+        return route.fulfill(json({ ok: true }));
+      }
+      case '/v1/unload-model': { state.models.find((x) => x.id === body.model).state = 'unloaded'; return route.fulfill(json({ ok: true })); }
+      case '/v1/models/rescan': return route.fulfill(json({ added: 2 }));
+      case '/props': return route.fulfill(json({ settings: { version: '9.9.9', mtp: {}, prefix_cache: {} }, memory: { available_bytes: 5e9, total_bytes: 128 * GiB }, batching: {} }));
+      case '/v1/tools': return route.fulfill(json({ edit_default: false }));
+      case '/metrics.json': case '/metrics': return route.fulfill(json({ error: { message: 'metrics off' } }, 503));
+      default: return route.fulfill(json({}, 404));
+    }
+  }
+  return { state, calls, handle, hold, gates, count: (p, method) => calls.filter((c) => c.path === p && (!method || c.method === method)).length };
+}
+
+async function open(browser, server, urlPath, { viewport = { width: 1440, height: 900 }, mode = 'compact', clock = true, scheme = 'dark', storage = {} } = {}) {
+  const context = await browser.newContext({ viewport, colorScheme: scheme });
+  const page = await context.newPage();
+  const errors = [];
+  page.on('pageerror', (error) => errors.push(error.message));
+  page.on('dialog', (dialog) => { errors.push(`native dialog: ${dialog.message()}`); dialog.dismiss(); });
+  await page.route(`${ORIGIN}/**`, server.handle);
+  await page.addInitScript(([m, extra]) => { try { localStorage.setItem('sushi-ui-mode', m); for (const [k, v] of Object.entries(extra)) localStorage.setItem(k, v); } catch { /* storage off */ } }, [mode, storage]);
+  if (clock) await page.clock.install();
+  await page.goto(`${ORIGIN}${urlPath}`);
+  return { page, context, errors };
+}
+const settle = async (page, ms = 0) => { if (ms) await page.clock.runFor(ms); await page.waitForTimeout(150); };
+const row = (key) => `.set[data-key="${key}"]`;
+
+async function main() {
+  const playwright = loadPlaywright();
+  if (!playwright) { console.log('Web UI admin views (browser): skipped (Playwright is not installed)'); return; }
+  let browser;
+  try { browser = await playwright.chromium.launch(); } catch (error) {
+    console.log(`Web UI admin views (browser): skipped (no Chromium: ${String(error.message).split('\n')[0]})`);
+    return;
+  }
+  try {
+    {
+      // An edit in progress survives the polls, keeps focus, and an unchanged answer touches no DOM.
+      const server = makeServer();
+      const { page, context, errors } = await open(browser, server, '/models#Qwen-A');
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      await page.fill(`${row('ctx_size')} input`, '4096');
+      await page.evaluate(() => { window.__input = document.querySelector('.set[data-key="ctx_size"] input'); window.__mutations = 0; window.__where = []; new MutationObserver((list) => { for (const m of list.filter((x) => x.type === 'childList')) { window.__mutations += 1; window.__where.push(`${m.target.id || m.target.className || m.target.tagName}`); } }).observe(document.getElementById('modelsPanel'), { subtree: true, childList: true }); });
+      await settle(page, 16_000);
+      assert.equal(await page.inputValue(`${row('ctx_size')} input`), '4096', 'the typed value survives three polls');
+      assert.equal(await page.evaluate(() => document.activeElement === window.__input), true, 'and so does focus');
+      assert.equal(await page.evaluate(() => window.__input === document.querySelector('.set[data-key="ctx_size"] input')), true, 'the control is the same element');
+      assert.ok(await page.isVisible('.savebar'), 'the save bar shows for a dirty form');
+      assert.match(await page.textContent('.savebar'), /1 unsaved change/);
+      assert.ok(server.count('/v1/settings', 'GET') >= 2, 'the page did poll');
+      await page.click('.savebar button:text-is("Discard")');
+      assert.equal(await page.inputValue(`${row('ctx_size')} input`), '65536', 'Discard restores the saved value');
+      assert.equal(await page.isVisible('.savebar'), false);
+      await page.evaluate(() => { window.__mutations = 0; window.__where = []; });
+      await settle(page, 16_000);
+      assert.equal(await page.evaluate(() => window.__mutations), 0, `identical answers cause no childList mutation (${await page.evaluate(() => window.__where)})`);
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+
+    {
+      // Save: one POST with only the changed key, a toast that outlives the refresh, then the new source badge.
+      const server = makeServer();
+      const { page, context, errors } = await open(browser, server, '/models#Qwen-A');
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      await page.fill(`${row('ctx_size')} input`, '4096');
+      await page.click('.savebar button:text-is("Save")');
+      await page.waitForSelector('.toast');
+      await settle(page, 1000);
+      const posts = server.calls.filter((c) => c.path === '/v1/settings' && c.method === 'POST');
+      assert.equal(posts.length, 1);
+      assert.deepEqual(posts[0].body, { model: 'Qwen-A', set: { ctx_size: 4096 } });
+      assert.match(await page.textContent('#toastHost'), /Saved/, 'the confirmation is still on screen after the refresh');
+      assert.equal(await page.isVisible('.savebar'), false, 'the form is clean again');
+      assert.match(await page.textContent('.callout'), /Reload now|differ/, 'a loaded model offers a reload');
+      await settle(page, 16_000);
+      assert.equal(await page.inputValue(`${row('ctx_size')} input`), '4096', 'and the saved value is what the page shows');
+      assert.match(await page.textContent(row('ctx_size')), /Saved/);
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+
+    {
+      // Half a number is a bad value: no request, a visible reason, the key is not deleted.
+      const server = makeServer();
+      const { page, context, errors } = await open(browser, server, '/models#Qwen-A');
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      await page.fill(`${row('ctx_size')} input`, '1e');
+      assert.equal(await page.getAttribute(`${row('ctx_size')} input`, 'aria-invalid'), 'true');
+      assert.ok(await page.isVisible(`${row('ctx_size')} .bad`));
+      assert.equal(await page.isDisabled('.savebar button:text-is("Save")'), true, 'Save waits for a valid value');
+      await page.evaluate(() => [...document.querySelectorAll('.savebar button')].find((b) => b.textContent === 'Save').click());
+      assert.equal(server.count('/v1/settings', 'POST'), 0, 'nothing is sent');
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+
+    {
+      // A file value stored as the number 0 is shown as "off" and an unrelated Save leaves it alone.
+      const server = makeServer();
+      const { page, context, errors } = await open(browser, server, '/models#GLM-B');
+      await page.waitForSelector(`${row('kv_quant')} select`);
+      assert.equal(await page.inputValue(`${row('kv_quant')} select`), 'off');
+      await page.click(`${row('mtp')} button:text-is("On")`);
+      await page.click('.savebar button:text-is("Save")');
+      await page.waitForSelector('.toast');
+      assert.deepEqual(server.calls.find((c) => c.method === 'POST' && c.path === '/v1/settings').body, { model: 'GLM-B', set: { mtp: true } });
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+
+    {
+      // The user's choice for the "More settings" fold, and the model they picked, survive polls.
+      const server = makeServer();
+      const { page, context } = await open(browser, server, '/models#Qwen-A', { mode: 'advanced' });
+      await page.waitForSelector('details.more-set');
+      assert.equal(await page.evaluate(() => document.querySelector('details.more-set').open), true, 'Advanced opens it');
+      await page.click('details.more-set > summary');
+      await settle(page, 16_000);
+      assert.equal(await page.evaluate(() => document.querySelector('details.more-set').open), false, 'a collapsed fold stays collapsed');
+      await context.close();
+    }
+
+    {
+      // A failing answer shows a short alert, never HTML; the next good answer clears it.
+      const server = makeServer();
+      const { page, context } = await open(browser, server, '/models#Qwen-A');
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      server.state.failSettings = 1;
+      await settle(page, 16_000);
+      assert.match(await page.textContent('#modelsPanel .alert.err'), /The server answered 500/);
+      assert.equal(await page.evaluate(() => /<html>/.test(document.getElementById('modelsPanel').textContent)), false);
+      await settle(page, 16_000);
+      assert.equal(await page.isVisible('#modelsPanel .alert.err'), false, 'the alert goes when the server answers again');
+      await context.close();
+    }
+
+    {
+      // Load: one request however fast the double click, the row shows Loading, the poll keeps going, the result is announced.
+      const server = makeServer();
+      let release;
+      server.state.loadDelay = new Promise((resolve) => { release = resolve; });
+      const { page, context, errors } = await open(browser, server, '/models#GLM-B');
+      await page.waitForSelector('.d-actions button');
+      await page.dblclick('.d-actions >> text=Load');
+      await settle(page);
+      assert.equal(server.count('/v1/load-model'), 1, 'a double click is one request');
+      assert.match(await page.textContent('.d-actions'), /Loading/);
+      const before = server.count('/v1/models');
+      for (let i = 0; i < 5; i++) await settle(page, 2000);
+      assert.ok(server.count('/v1/models') - before >= 3, `polling continues while a load is pending (${server.count('/v1/models') - before})`);
+      assert.match(await page.textContent('.list [data-id="GLM-B"]'), /Loading/);
+      await page.click('.list [data-id="Deep-C"] button');
+      await settle(page);
+      assert.equal(server.count('/v1/load-model'), 2, 'another model can load meanwhile');
+      release();
+      await page.waitForFunction(() => /Loaded/.test(document.getElementById('toastHost').textContent));
+      await settle(page, 6000);
+      assert.match(await page.textContent('.d-actions'), /Unload/);
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+
+    {
+      // A failed load shows the server's reason where the user is looking and leaves Load available.
+      const server = makeServer();
+      server.state.loadFails = true;
+      const { page, context } = await open(browser, server, '/models#GLM-B');
+      await page.waitForSelector('.d-actions button');
+      await page.click('.d-actions >> text=Load');
+      await page.waitForSelector('.detail .alert.err');
+      assert.match(await page.textContent('.detail .alert.err'), /out of memory: needs 61 GiB/);
+      assert.equal(await page.isEnabled('.d-actions >> text=Load'), true);
+      await context.close();
+    }
+
+    {
+      // The failed model's raw state word never reaches the screen.
+      const server = makeServer();
+      const { page, context } = await open(browser, server, '/models');
+      await page.waitForSelector('.list [data-id="Broke-D"]');
+      const text = await page.textContent('.list [data-id="Broke-D"]');
+      assert.match(text, /Load failed/);
+      assert.doesNotMatch(text, /error_state/);
+      assert.ok(await page.isVisible('.list [data-id="Broke-D"] button'), 'a failed model can be loaded again');
+      await context.close();
+    }
+
+    {
+      // The oldest answer never overwrites a newer one.
+      const server = makeServer();
+      let slow;
+      server.state.settingsDelay.push(new Promise((resolve) => { slow = resolve; }));
+      const { page, context } = await open(browser, server, '/models#Qwen-A');
+      await page.waitForTimeout(300);
+      server.state.models[0].settings.ctx_size = keyState({ file: 2048, source: 'file' });
+      await page.evaluate(() => window.sushiAdmin.refresh());
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      assert.equal(await page.inputValue(`${row('ctx_size')} input`), '2048');
+      slow();
+      await page.waitForTimeout(400);
+      assert.equal(await page.inputValue(`${row('ctx_size')} input`), '2048', 'the late, older answer is dropped');
+      await context.close();
+    }
+
+    {
+      // A flag-locked key shows the flag's value and says why; a key the pack cannot use is not listed.
+      const server = makeServer();
+      const { page, context } = await open(browser, server, '/models#Qwen-A');
+      await page.waitForSelector(row('kv_quant'));
+      assert.equal(await page.$eval(`${row('kv_quant')} select`, (n) => n.selectedOptions[0].textContent), '8-bit');
+      assert.equal(await page.isDisabled(`${row('kv_quant')} select`), true);
+      assert.match(await page.textContent(row('kv_quant')), /--kv-quant 8/);
+      assert.match(await page.textContent(row('kv_quant')), /Launch flag/);
+      assert.equal(await page.isVisible(row('vision')), true, 'an image model lists its vision tower');
+      assert.equal(await page.locator(row('ssd_budget_gb')).count(), 0, 'a resident model has no SSD budget row');
+      await page.click('.list [data-id="Deep-C"]');
+      await page.waitForSelector(row('ssd_budget_gb'));
+      assert.equal(await page.isVisible(row('ssd_budget_gb')), true, 'a streamed model shows it in Compact');
+      assert.equal(await page.locator(row('vision')).count(), 0, 'a text model has no vision row');
+      assert.equal(await page.evaluate(() => location.hash), '#Deep-C');
+      // `streaming` only says the pack can stream; with no budget it loads resident.
+      assert.match(await page.textContent('.detail .facts'), /can stream experts/);
+      assert.match(await page.textContent('.detail .facts'), /96\.0 GiB on disk.*40\.0 GiB linked from elsewhere/);
+      assert.match(await page.textContent('.detail .facts'), /Pack 2\.0 available — sushi pull deepseek-v4\.1-flash/);
+      await page.click('.list [data-id="Qwen-A"]');
+      await page.waitForFunction(() => document.querySelector('#modelsDetail h2')?.textContent === 'Qwen-A');
+      assert.doesNotMatch(await page.textContent('.detail .facts'), /linked from elsewhere|Pack .* available/);
+      await page.click('.list [data-id="Deep-C"]');
+      await page.waitForFunction(() => document.querySelector('#modelsDetail h2')?.textContent === 'Deep-C');
+      assert.doesNotMatch(await page.textContent('.list [data-id="Deep-C"]'), /streams experts/);
+      await context.close();
+    }
+
+    {
+      // Leaving a dirty form asks first; Rescan posts once.
+      const server = makeServer();
+      const { page, context, errors } = await open(browser, server, '/models#Qwen-A');
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      await page.fill(`${row('ctx_size')} input`, '4096');
+      await page.click('.list [data-id="GLM-B"]');
+      assert.equal(await page.evaluate(() => document.getElementById('confirmDialog').open), true);
+      assert.match(await page.textContent('#confirmDialog'), /unsaved/);
+      await page.click('#confirmDialog >> text=Keep editing');
+      assert.equal(await page.inputValue(`${row('ctx_size')} input`), '4096');
+      await page.click('.list [data-id="GLM-B"]');
+      await page.click('#confirmDialog button:text-is("Discard")');
+      await page.waitForFunction(() => location.hash === '#GLM-B');
+      await page.click('text=Rescan');
+      await page.waitForFunction(() => /2 new models/.test(document.getElementById('toastHost').textContent));
+      assert.equal(server.count('/v1/models/rescan'), 1);
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+
+    {
+      // The model's own cache: bytes in the button, and a dialog that names them; a loaded row shows its memory.
+      const server = makeServer();
+      const { page, context, errors } = await open(browser, server, '/models#Qwen-A');
+      await page.waitForSelector('.detail >> text=Clear this model');
+      assert.match(await page.textContent('.detail'), /41\.2 GiB/);
+      assert.match(await page.textContent('.list [data-id="Qwen-A"]'), /40\.0 GiB in memory/);
+      await page.click('.detail >> text=Clear this model');
+      assert.match(await page.textContent('#confirmDialog'), /41\.2 GiB/);
+      await page.click('#confirmDialog >> text=Cancel');
+      assert.equal(server.count('/v1/prefix-cache/clear'), 0);
+      await page.click('.detail >> text=Clear this model');
+      await page.click('#confirmDialog button.danger-fill');
+      await page.waitForFunction(() => /Freed/.test(document.getElementById('toastHost').textContent));
+      assert.deepEqual(server.calls.find((c) => c.path === '/v1/prefix-cache/clear').body, { scope: 'model', model: 'Qwen-A' });
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+
+    {
+      // Settings: bulk buttons carry their bytes, confirm before deleting, and say what stays.
+      const server = makeServer();
+      const { page, context, errors } = await open(browser, server, '/settings');
+      await page.waitForSelector('#clearStale');
+      assert.match(await page.textContent('#clearStale'), /22\.1 GiB/);
+      assert.match(await page.textContent('#clearAll'), /63\.3 GiB/, 'all = everything not held by another server');
+      await page.click('#clearStale');
+      assert.equal(await page.evaluate(() => document.getElementById('confirmDialog').open), true);
+      assert.match(await page.textContent('#confirmDialog'), /22\.1 GiB/);
+      assert.equal(await page.evaluate(() => document.activeElement.textContent), 'Cancel', 'focus starts on the safe choice');
+      await page.keyboard.press('Escape');
+      assert.equal(server.count('/v1/prefix-cache/clear'), 0, 'Escape cancels');
+      await page.click('#clearStale');
+      await page.click('#confirmDialog button.danger-fill');
+      await page.waitForFunction(() => /Freed 22\.1 GiB/.test(document.getElementById('toastHost').textContent));
+      assert.deepEqual(server.calls.find((c) => c.path === '/v1/prefix-cache/clear').body, { scope: 'stale' });
+      assert.equal(server.count('/v1/prefix-cache/clear'), 1);
+      await settle(page, 12_000);
+      assert.equal(await page.isDisabled('#clearStale'), true, 'nothing stale is left to clear');
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+
+    {
+      // Assigned space: GiB, 0 turns the cache off only after a confirmation; a locked models folder offers no input.
+      const server = makeServer({ dirLocked: true });
+      const { page, context, errors } = await open(browser, server, '/settings');
+      await page.waitForSelector('#cacheGb');
+      assert.equal(await page.inputValue('#cacheGb'), '100');
+      assert.match(await page.textContent('#cacheCard'), /GiB/);
+      await page.fill('#cacheGb', '0');
+      await page.click('#cacheSave');
+      assert.match(await page.textContent('#confirmDialog'), /off/i);
+      await page.click('#confirmDialog >> text=Cancel');
+      assert.equal(server.count('/v1/settings', 'POST'), 0);
+      assert.equal(await page.locator('#dirPath').count(), 0, 'a --model-dir launch flag leaves no input');
+      assert.match(await page.textContent('#dirCard'), /--model-dir/);
+      assert.match(await page.textContent('#dirCard'), /\/models/);
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+
+    {
+      // The 390 px phone: nothing scrolls sideways on the Models and Settings tabs, and the detail replaces the list.
+      const server = makeServer();
+      const phone = { width: 390, height: 844 };
+      for (const view of ['/models', '/settings', '/models#Qwen-A']) {
+        const { page, context } = await open(browser, server, view, { viewport: phone, mode: 'advanced' });
+        await page.waitForSelector(view === '/models' ? '.list [data-id]' : view === '/settings' ? '#cacheCard' : '.detail .set');
+        await page.waitForTimeout(300);
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth), 390, `${view} fits 390 px`);
+        await context.close();
+      }
+      const { page, context } = await open(browser, server, '/models', { viewport: phone });
+      await page.waitForSelector('.list [data-id="Qwen-A"]');
+      await page.click('.list [data-id="Qwen-A"]');
+      assert.equal(await page.isVisible('.list'), false, 'the detail takes the whole screen');
+      assert.equal(await page.isVisible('.detail'), true);
+      await page.click('[aria-label="Back to models"]');
+      assert.equal(await page.isVisible('.list'), true);
+      assert.equal(await page.evaluate(() => location.hash), '');
+      await context.close();
+    }
+    {
+      // Per-model limits: a value or combination the model cannot run is refused on the row, before and after the save.
+      const server = makeServer({ limits: true });
+      const { page, context, errors } = await open(browser, server, '/models#Qwen-A', { mode: 'advanced' });
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      await page.fill(`${row('ctx_size')} input`, '200000');
+      assert.match(await page.textContent(`${row('ctx_size')} .bad`), /context window is 131072/);
+      assert.equal(await page.isDisabled('.savebar button:text-is("Save")'), true, 'a value past the model maximum cannot be saved');
+      await page.fill(`${row('ctx_size')} input`, '65536');
+      assert.equal(await page.isVisible('.savebar'), false);
+      const four = `${row('kv_quant')} option[value="4"]`;
+      assert.equal(await page.isDisabled(four), true);
+      assert.match(await page.textContent(four), /not for this model/);
+      assert.match(await page.textContent(row('kv_quant')), /need a different cache layout/, 'the reason is on the row, not only in a tooltip');
+      assert.equal(await page.isDisabled(`${row('mtp_acceptance')} select`), false, 'MTP at its default leaves acceptance usable');
+      await page.click(`${row('mtp')} button:text-is("Off")`);
+      assert.equal(await page.isDisabled(`${row('mtp_acceptance')} select`), true, 'turning MTP off disables acceptance at once');
+      assert.match(await page.textContent(row('mtp_acceptance')), /Used only while MTP is on/);
+      assert.equal(await page.isDisabled(`${row('mtp_greedy_tail')} button:text-is("On")`), true);
+      await page.click(`${row('mtp')} button:text-is("On")`);
+      assert.equal(await page.isDisabled(`${row('mtp_acceptance')} select`), false);
+      await page.click(`${row('mtp')} button:text-is("Off")`);
+      await page.click('.savebar button:text-is("Save")');
+      await settle(page, 1000);
+      assert.deepEqual(server.calls.find((c) => c.path === '/v1/settings' && c.method === 'POST').body.set, { mtp: false }, 'only the usable change is sent');
+      await page.fill(`${row('think_penalty')} input`, '2');
+      await page.click('.savebar button:text-is("Save")');
+      await settle(page, 1000);
+      assert.match(await page.textContent(`${row('think_penalty')} .bad`), /not supported by this model/, 'a refusal naming a setting shows on its row');
+      await page.click('.list [data-id="Deep-C"]');
+      await page.click('#confirmDialog button.danger-fill');
+      await page.waitForFunction(() => document.querySelector('.detail h2')?.textContent === 'Deep-C');
+      assert.equal(await page.isDisabled(`${row('kv_quant')} select`), true, 'Advanced lists a key the model lacks, greyed');
+      assert.match(await page.textContent(row('kv_quant')), /no KV cache to quantize/);
+      assert.equal(await page.locator(row('mtp_acceptance')).count(), 0, 'a key without a limits entry is not listed');
+      assert.equal(await page.isDisabled(`${row('mtp')} button:text-is("On")`), false);
+      await page.fill(`${row('ssd_budget_gb')} input`, '8');
+      assert.equal(await page.isDisabled(`${row('mtp')} button:text-is("On")`), true, 'an SSD budget switches MTP off at once');
+      assert.match(await page.textContent(row('mtp')), /cannot run while they stream/);
+      await page.fill(`${row('ssd_budget_gb')} input`, '');
+      assert.equal(await page.isDisabled(`${row('mtp')} button:text-is("On")`), false);
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+    {
+      // A newer server says which keys apply, what the loaded model started with, and clears one namespace at a time.
+      const server = makeServer();
+      Object.assign(server.state.server.prefix_cache_disk_gb, { ask_bytes: 30 * GiB });
+      Object.assign(server.state.models[0], { keys: ['ctx_size', 'kv_quant', 'mtp', 'vision'], loaded_with: { ctx_size: 65536, kv_quant: null } });
+      server.state.cache.namespaces.push({ id: 'dddddddd44444444', bytes: Math.round(3 * GiB), entries: 2, newest_mtime: Date.now() / 1000 - 5 * 86400, model: null, stale: true, held_by_other_process: false, tier: null });
+      const { page, context, errors } = await open(browser, server, '/models#Qwen-A', { mode: 'advanced' });
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      assert.deepEqual(await page.$$eval('.detail .set', (rows) => rows.map((r) => r.dataset.key)), ['ctx_size', 'kv_quant', 'mtp', 'vision'], 'the server decides which keys the model has');
+      assert.equal(await page.isVisible('.callout'), false, 'saved equals what the model loaded with: nothing to reload');
+      await page.fill(`${row('ctx_size')} input`, '4096');
+      await page.click('.savebar button:text-is("Save")');
+      await settle(page, 1000);
+      assert.equal(await page.isVisible('.callout'), true, 'a saved value the loaded model lacks asks for a reload');
+      await page.fill(`${row('ctx_size')} input`, '65536');
+      await page.click('.savebar button:text-is("Save")');
+      await settle(page, 1000);
+      assert.equal(await page.isVisible('.callout'), false, 'saving the loaded value back clears the prompt even after an earlier save');
+      await page.click('#navSettings');
+      await page.waitForSelector('#cacheRows tr');
+      assert.equal(await page.getAttribute('#cacheGb', 'placeholder'), '30', 'the placeholder is what the next load starts from');
+      const clears = page.locator('#cacheRows button:text-is("Clear…")');
+      assert.equal(await clears.count(), 3, 'every stale row can be cleared on its own, and the loaded one');
+      await page.click('#cacheRows tr:has-text("22.1") button');
+      assert.match(await page.textContent('#confirmDialog'), /22\.1 GiB/);
+      await page.click('#confirmDialog button.danger-fill');
+      await page.waitForFunction(() => /Freed 22\.1 GiB/.test(document.getElementById('toastHost').textContent));
+      assert.deepEqual(server.calls.find((c) => c.path === '/v1/prefix-cache/clear').body, { scope: 'namespace', id: 'bbbbbbbb22222222' });
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+    const failures = [];
+    const phone = { width: 390, height: 844 };
+    // One bug, one scenario: a failure is recorded and the next scenario still runs.
+    const scenario = async (name, cfg, fn) => {
+      const server = makeServer(cfg.serverOpts);
+      cfg.setup?.(server);
+      let context;
+      try {
+        const o = await open(browser, server, cfg.path, cfg.open);
+        context = o.context;
+        await fn({ page: o.page, server, errors: o.errors });
+        assert.deepEqual(o.errors, [], 'page errors');
+      } catch (error) { failures.push(`${name}: ${String(error.message).split('\n').slice(0, 3).join(' ')}`); } finally { await context?.close(); }
+    };
+    const dialogOpen = (page) => page.evaluate(() => document.getElementById('confirmDialog').open);
+    const plainModel = (id) => ({ id, state: 'unloaded', bytes_on_disk: 10 * GiB, context_length: 131072, input_modalities: ['text'], keys: BASE_KEYS, settings: allKeys() });
+
+    await scenario('hash change with unsaved edits: Keep editing holds the model', { path: '/models#Qwen-A' }, async ({ page }) => {
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      await page.fill(`${row('ctx_size')} input`, '4096');
+      await page.evaluate(() => { location.hash = '#GLM-B'; });
+      await page.waitForFunction(() => document.getElementById('confirmDialog').open);
+      assert.equal(await page.textContent('#modelsDetail h2'), 'Qwen-A', 'the form stays while the prompt is open');
+      const length = await page.evaluate(() => history.length);
+      await page.click('#confirmDialog >> text=Keep editing');
+      await settle(page);
+      assert.equal(await page.textContent('#modelsDetail h2'), 'Qwen-A');
+      assert.equal(await page.inputValue(`${row('ctx_size')} input`), '4096');
+      assert.equal(await page.evaluate(() => location.hash), '#Qwen-A');
+      assert.equal(await page.evaluate(() => history.length), length, 'no extra history entry');
+    });
+    await scenario('Back with unsaved edits: Keep editing, then Discard', { path: '/models#GLM-B', open: { clock: false } }, async ({ page }) => {
+      await page.waitForSelector('.list [data-id="Qwen-A"]');
+      await page.click('.list [data-id="Qwen-A"]');
+      await page.waitForFunction(() => document.querySelector('#modelsDetail h2')?.textContent === 'Qwen-A');
+      await page.fill(`${row('ctx_size')} input`, '4096');
+      await page.goBack();
+      await page.waitForFunction(() => document.getElementById('confirmDialog').open);
+      await page.click('#confirmDialog >> text=Keep editing');
+      await page.waitForTimeout(200);
+      assert.equal(await page.textContent('#modelsDetail h2'), 'Qwen-A');
+      assert.equal(await page.inputValue(`${row('ctx_size')} input`), '4096');
+      assert.equal(await page.evaluate(() => location.hash), '#Qwen-A');
+      await page.click('.list [data-id="GLM-B"]');
+      await page.click('#confirmDialog button:text-is("Discard")');
+      await page.waitForFunction(() => document.querySelector('#modelsDetail h2')?.textContent === 'GLM-B');
+      assert.equal(await page.evaluate(() => location.hash), '#GLM-B');
+    });
+    await scenario('a vanished model leaves no live detail', { path: '/models#GLM-B' }, async ({ page, server }) => {
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      server.state.models = server.state.models.filter((m) => m.id !== 'GLM-B');
+      await settle(page, 16_000);
+      await settle(page, 16_000);
+      assert.equal(await page.locator('#modelsDetail .set').count(), 0, 'no editable form for a model that is gone');
+      assert.equal(await page.locator('#modelsDetail .d-actions').count(), 0, 'and no Load button');
+      assert.match(await page.textContent('#modelsDetail'), /not (found|in the list)/i);
+    });
+    await scenario('an unknown model on a phone is not a blank screen', { path: '/models#Nope', open: { viewport: phone } }, async ({ page }) => {
+      await page.waitForSelector('#modelsMd');
+      await settle(page);
+      assert.match(await page.innerText('#modelsDetail'), /not (found|in the list)/i);
+      assert.equal(await page.isVisible('#modelsDetail'), true);
+      await page.click('#modelsDetail >> text=Back to Models');
+      assert.equal(await page.evaluate(() => location.hash), '');
+      assert.equal(await page.isVisible('#modelsList'), true);
+    });
+    await scenario('alerts never print null', { path: '/models#Qwen-A' }, async ({ page, server }) => {
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      server.state.failSettings = 1;
+      await settle(page, 16_000);
+      assert.doesNotMatch(await page.innerText('#modelsAlert'), /null/);
+      assert.equal(await page.locator('#modelsAlert button:text-is("Retry")').count(), 1);
+      server.state.hooks['/v1/settings'] = async (body, method) => (method === 'POST' ? { status: 500, contentType: 'text/html', body: '<html>boom</html>' } : null);
+      await page.fill(`${row('ctx_size')} input`, '4096');
+      await page.click('.savebar button:text-is("Save")');
+      await settle(page, 500);
+      const text = await page.innerText('#modelsDetail .alert.err:not([hidden])');
+      assert.match(text, /Couldn't save/);
+      assert.doesNotMatch(text, /null/);
+    });
+    await scenario('a Load failed message goes when the model is loaded elsewhere', { path: '/models#GLM-B', setup: (s) => { s.state.loadFails = true; } }, async ({ page, server }) => {
+      await page.waitForSelector('.d-actions button');
+      await page.click('.d-actions >> text=Load');
+      await page.waitForSelector('.detail .alert.err:not([hidden])');
+      server.state.loadFails = false;
+      Object.assign(server.state.models.find((m) => m.id === 'GLM-B'), { state: 'ready', bytes_resident: 61 * GiB });
+      await settle(page, 6000);
+      assert.equal(await page.isVisible('.detail .alert.err'), false, 'a loaded model shows no failure');
+      assert.doesNotMatch(await page.textContent('.list [data-id="GLM-B"]'), /failed/i);
+    });
+    await scenario('a flag-pinned assigned space shows the flag, not the file', { path: '/settings', setup: (s) => {
+      Object.assign(s.state.server.prefix_cache_disk_gb, { file: 100, flag: '512MB', source: 'flag', locked: true, effective_bytes: 512 * 2 ** 20, ask_bytes: 512 * 2 ** 20 });
+      Object.assign(s.state.server.models_dir, { flag: '/models', source: 'flag', locked: true });
+    } }, async ({ page }) => {
+      await page.waitForSelector('#cacheGb');
+      assert.equal(await page.inputValue('#cacheGb'), '512MB');
+      assert.equal(await page.isDisabled('#cacheGb'), true);
+      assert.match(await page.textContent('#cacheUsage'), /of 512 MiB/);
+      assert.match(await page.textContent('#cacheCard'), /--prefix-cache-disk 512MB/);
+      assert.match(await page.textContent('#cacheCard'), /Launch flag/);
+      assert.doesNotMatch(await page.textContent('.set[data-key="prefix_cache_disk_gb"]'), /Applies now/, 'a pinned size does not apply now');
+      assert.doesNotMatch(await page.textContent('#dirCard'), /Applies now/);
+    });
+    await scenario('a flag that pins MTP acceptance prints its own spelling', { path: '/models#Qwen-A', open: { mode: 'advanced' }, setup: (s) => {
+      s.state.models[0].settings.mtp_acceptance = keyState({ flag: '--mtp-tokenv3 0.5', source: 'flag', locked: true });
+    } }, async ({ page }) => {
+      await page.waitForSelector(row('mtp_acceptance'));
+      const text = await page.textContent(row('mtp_acceptance'));
+      assert.match(text, /--mtp-tokenv3 0\.5/);
+      assert.doesNotMatch(text, /--mtp-typical|\bset\b/);
+      assert.equal(await page.$eval(`${row('mtp_acceptance')} select`, (n) => n.selectedOptions[0].textContent), 'tokenv3');
+    });
+    await scenario('a value-only lock on MTP acceptance shows the choice it names', { path: '/models#Qwen-A', open: { mode: 'advanced' }, setup: (s) => {
+      s.state.models[0].settings.mtp_acceptance = keyState({ flag: 'typical', source: 'flag', locked: true });
+    } }, async ({ page }) => {
+      await page.waitForSelector(row('mtp_acceptance'));
+      assert.equal(await page.$eval(`${row('mtp_acceptance')} select`, (n) => n.selectedOptions[0].textContent), 'typical');
+      assert.match(await page.textContent(row('mtp_acceptance')), /Set by a launch flag\./);
+    });
+    await scenario('a flag the page cannot read shows Launch flag, never "set"', { path: '/models#Qwen-A', open: { mode: 'advanced' }, setup: (s) => {
+      s.state.models[0].settings.mtp_acceptance = keyState({ flag: 'set', source: 'flag', locked: true });
+      s.state.models[0].settings.mtp_greedy_tail = keyState({ flag: '--mtp-greedy-tail', source: 'flag', locked: true });
+    } }, async ({ page }) => {
+      await page.waitForSelector(row('mtp_acceptance'));
+      assert.equal(await page.$eval(`${row('mtp_acceptance')} select`, (n) => n.selectedOptions[0].textContent), 'Launch flag');
+      assert.doesNotMatch(await page.textContent(row('mtp_acceptance')), /--mtp-typical/);
+      assert.match(await page.textContent(row('mtp_greedy_tail')), /Set by --mtp-greedy-tail at launch/);
+    });
+    await scenario('saving one server setting keeps the other one\'s draft', { path: '/settings' }, async ({ page }) => {
+      await page.waitForSelector('#dirPath');
+      await page.fill('#dirPath', '/tmp/typed');
+      await page.fill('#cacheGb', '7');
+      await page.click('#cacheSave');
+      await page.waitForSelector('.toast');
+      await settle(page, 1000);
+      assert.equal(await page.inputValue('#dirPath'), '/tmp/typed', 'the folder draft survives a cache save');
+      await page.fill('#cacheGb', '9');
+      await page.click('#dirSave');
+      await settle(page, 1000);
+      assert.equal(await page.inputValue('#cacheGb'), '9', 'the size draft survives a folder save');
+    });
+    await scenario('an auto-selected model stays under an edit', { path: '/models', setup: (s) => { s.state.models[0].state = 'unloaded'; } }, async ({ page }) => {
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      assert.equal(await page.textContent('#modelsDetail h2'), 'Broke-D');
+      await page.fill(`${row('ctx_size')} input`, '4096');
+      await page.click('.list [data-id="GLM-B"] button');
+      await settle(page, 3000);
+      assert.equal(await page.textContent('#modelsDetail h2'), 'Broke-D', 'a load elsewhere does not move the selection');
+      assert.equal(await page.inputValue(`${row('ctx_size')} input`), '4096');
+    });
+    await scenario('a tab switch with unsaved edits asks, and the model is kept on return', { path: '/models#GLM-B' }, async ({ page }) => {
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      await page.fill(`${row('ctx_size')} input`, '4096');
+      await page.click('#navSettings');
+      assert.equal(await dialogOpen(page), true, 'leaving a dirty form asks');
+      await page.click('#confirmDialog >> text=Keep editing');
+      await settle(page);
+      assert.equal(await page.isVisible('#modelsPanel'), true);
+      assert.equal(await page.inputValue(`${row('ctx_size')} input`), '4096');
+      await page.click('#navSettings');
+      await page.click('#confirmDialog button:text-is("Discard")');
+      await page.waitForSelector('#settingsPanel:not([hidden])');
+      await page.click('#navModels');
+      await page.waitForSelector('#modelsDetail h2');
+      assert.equal(await page.textContent('#modelsDetail h2'), 'GLM-B', 'back on the model that was open');
+      assert.equal(await page.evaluate(() => location.hash), '#GLM-B');
+    });
+    await scenario('Cmd+4 with unsaved edits asks like a click on Settings', { path: '/models#GLM-B' }, async ({ page }) => {
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      await page.fill(`${row('ctx_size')} input`, '4096');
+      await page.keyboard.press('Meta+4');
+      assert.equal(await dialogOpen(page), true, 'the shortcut asks before leaving a dirty form');
+      await page.click('#confirmDialog >> text=Keep editing');
+      await settle(page);
+      assert.equal(await page.isVisible('#modelsPanel'), true);
+      assert.equal(await page.inputValue(`${row('ctx_size')} input`), '4096');
+    });
+    await scenario('a clean tab switch returns to the same model', { path: '/models' }, async ({ page }) => {
+      await page.waitForSelector('.list [data-id="GLM-B"]');
+      await page.click('.list [data-id="GLM-B"]');
+      await page.click('#navSettings');
+      await page.waitForSelector('#settingsPanel:not([hidden])');
+      await page.click('#navModels');
+      await page.waitForSelector('#modelsDetail h2');
+      assert.equal(await page.textContent('#modelsDetail h2'), 'GLM-B');
+    });
+    await scenario('a filter on a hidden box does not strand the list', { path: '/models', setup: (s) => {
+      s.state.models = ['A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'Zeta', 'Zulu'].map(plainModel);
+    } }, async ({ page, server }) => {
+      await page.waitForSelector('.list [data-id="A1"]');
+      await page.fill('#modelsFilter', 'Z');
+      assert.equal(await page.locator('#modelsList .row').count(), 2);
+      server.state.models = server.state.models.filter((m) => !m.id.startsWith('Z') && m.id < 'A4');
+      await settle(page, 16_000);
+      await settle(page, 16_000);
+      assert.equal(await page.locator('#modelsList .row').count(), 3, 'the three left show');
+    });
+    await scenario('an invalid value in a closed fold opens it and says so', { path: '/models#Qwen-A', open: { mode: 'advanced' } }, async ({ page }) => {
+      await page.waitForSelector(`${row('think_penalty')} input`);
+      await page.fill(`${row('think_penalty')} input`, 'abc');
+      await page.click('#modeToggle [data-mode="compact"]');
+      await settle(page);
+      assert.equal(await page.evaluate(() => document.querySelector('details.more-set').open), true, 'the fold holding the error is open');
+      assert.equal(await page.isVisible(`${row('think_penalty')} .bad`), true);
+      assert.match(await page.textContent('details.more-set summary'), /1 invalid/);
+    });
+    await scenario('a saved value on a disabled key can be removed', { serverOpts: { limits: true }, path: '/models#Deep-C', open: { mode: 'advanced' }, setup: (s) => {
+      s.state.models[2].settings.preserve_thinking = keyState({ file: true, source: 'file' });
+    } }, async ({ page, server }) => {
+      const remove = `${row('preserve_thinking')} button:text-is("Remove saved value")`;
+      await page.waitForSelector(remove);
+      await page.click(remove);
+      await page.waitForFunction(() => /Removed|Saved/.test(document.getElementById('toastHost').textContent));
+      assert.deepEqual(server.calls.find((c) => c.method === 'POST' && c.path === '/v1/settings').body, { model: 'Deep-C', set: { preserve_thinking: null } });
+      await settle(page, 1000);
+      assert.equal(await page.isVisible(remove), false, 'nothing is left to remove');
+    });
+    await scenario('the load-error alert goes soon after the server is back', { path: '/models#Qwen-A' }, async ({ page, server }) => {
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      await settle(page, 1000);
+      server.state.down = true;
+      await settle(page, 6000);
+      await page.evaluate(() => window.sushiAdmin.refresh());
+      await settle(page);
+      assert.equal(await page.isVisible('#modelsAlert'), true);
+      server.state.down = false;
+      await settle(page, 5500);
+      assert.equal(await page.isVisible('#modelsAlert'), false, 'the alert clears once the server answers');
+    });
+    await scenario('a rebuilt list keeps focus on the same control; rows take arrows and Space', { path: '/models#Qwen-A' }, async ({ page, server }) => {
+      await page.waitForSelector('.list [data-id="Deep-C"] button');
+      await page.focus('.list [data-id="Deep-C"] button');
+      server.state.models[0].bytes_resident = 12 * GiB;
+      await settle(page, 6000);
+      assert.equal(await page.evaluate(() => document.activeElement.matches('.row[data-id="Deep-C"] button')), true, 'the Load button keeps focus');
+      await page.focus('.list [data-id="Broke-D"]');
+      await page.keyboard.press('ArrowDown');
+      assert.equal(await page.evaluate(() => document.activeElement.dataset.id), 'Deep-C');
+      await page.keyboard.press('Space');
+      assert.equal(await page.evaluate(() => location.hash), '#Deep-C');
+    });
+    await scenario('a file value the loader drops does not ask for a reload forever', { serverOpts: { limits: true }, path: '/models#Qwen-A', setup: (s) => {
+      s.state.models[0].settings.kv_quant = keyState({ file: '4', source: 'file' });
+      s.state.models[0].loaded_with = { ctx_size: 65536, kv_quant: null };
+    } }, async ({ page }) => {
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      assert.equal(await page.isVisible('.callout'), false);
+    });
+    await scenario('a click in the dialog padding does not close it', { path: '/settings' }, async ({ page }) => {
+      await page.waitForSelector('#clearAll:not([disabled])');
+      await page.click('#clearAll');
+      const b = await page.locator('#confirmDialog').boundingBox();
+      await page.mouse.click(b.x + 6, b.y + 6);
+      assert.equal(await dialogOpen(page), true, 'padding is part of the dialog');
+      await page.mouse.click(5, 5);
+      assert.equal(await dialogOpen(page), false, 'the backdrop still cancels');
+    });
+    await scenario('a cache row\'s Clear goes pending and cannot be repeated', { path: '/settings', setup: (s) => {
+      const gate = new Promise((resolve) => { s.release = resolve; });
+      s.state.hooks['/v1/prefix-cache/clear'] = async () => { await gate; return null; };
+    } }, async ({ page, server }) => {
+      const clear = () => page.locator('#cacheRows tr', { hasText: '22.1' }).locator('button');
+      await page.waitForSelector('#cacheRows tr button');
+      await clear().click();
+      await page.click('#cdOk');
+      await settle(page);
+      assert.equal(await clear().isDisabled(), true);
+      assert.match(await clear().textContent(), /Clearing/);
+      await clear().evaluate((b) => b.click());
+      assert.equal(await dialogOpen(page), false, 'no second confirmation');
+      server.release();
+      await settle(page, 1000);
+      assert.equal(server.count('/v1/prefix-cache/clear'), 1);
+    });
+    await scenario('the zero-size toast quotes the server', { path: '/settings' }, async ({ page }) => {
+      await page.waitForSelector('#cacheGb');
+      await page.fill('#cacheGb', '0');
+      await page.click('#cacheSave');
+      await page.click('#cdOk');
+      await page.waitForSelector('.toast');
+      const toast = await page.textContent('#toastHost');
+      assert.match(toast, /next model load/i);
+      assert.doesNotMatch(toast, /now has 0/);
+      await settle(page, 1000);
+      assert.doesNotMatch(await page.textContent('.set[data-key="prefix_cache_disk_gb"] .badges'), /Applies now/, 'a size of 0 applies at the next load');
+    });
+    await scenario('the model path shows when /v1/settings answers after /v1/models', { path: '/models#Qwen-A', open: { mode: 'advanced' }, setup: (s) => {
+      s.state.settingsDelay.push(new Promise((resolve) => { s.releaseSettings = resolve; }));
+    } }, async ({ page, server }) => {
+      await page.waitForSelector('#modelsDetail h2');
+      await page.waitForTimeout(300);
+      server.releaseSettings();
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      await page.waitForTimeout(300);
+      assert.equal(await page.locator('.facts .mono').count(), 1);
+    });
+    await scenario('065536 over a saved 65536 is not a change', { path: '/models#Qwen-A' }, async ({ page }) => {
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      await page.fill(`${row('ctx_size')} input`, '065536');
+      await settle(page);
+      assert.equal(await page.evaluate(() => document.querySelector('.set[data-key="ctx_size"]').classList.contains('dirty')), false);
+      assert.doesNotMatch(await page.textContent(`${row('ctx_size')} .hint`), /was/);
+      assert.equal(await page.isVisible('.savebar'), false);
+    });
+    await scenario('an empty models folder shows one Rescan and no empty detail card', { path: '/models', setup: (s) => { s.state.models = []; } }, async ({ page }) => {
+      await page.waitForSelector('#modelsList .empty');
+      assert.equal(await page.isVisible('#modelsDetail'), false);
+      assert.equal(await page.locator('button:visible', { hasText: 'Rescan' }).count(), 1);
+      assert.equal(await page.locator('#modelsList .empty >> text=Open Settings').count(), 1);
+    });
+    await scenario('In use lists the saved folder too', { path: '/settings', setup: (s) => { s.state.server.models_dir.file = '/extra/packs'; } }, async ({ page }) => {
+      await page.waitForSelector('#dirKv');
+      const text = await page.textContent('#dirKv');
+      assert.match(text, /\/models/);
+      assert.match(text, /\/extra\/packs/);
+    });
+    await scenario('Enter submits the size and the folder', { path: '/settings' }, async ({ page, server }) => {
+      await page.waitForSelector('#dirPath');
+      await page.fill('#cacheGb', '12');
+      await page.press('#cacheGb', 'Enter');
+      await page.waitForSelector('.toast');
+      assert.deepEqual(server.calls.find((c) => c.method === 'POST' && c.path === '/v1/settings').body, { server: { prefix_cache_disk_gb: 12 } });
+      await page.fill('#dirPath', '/x/y');
+      await page.press('#dirPath', 'Enter');
+      await settle(page, 500);
+      assert.deepEqual(server.calls.filter((c) => c.method === 'POST' && c.path === '/v1/settings')[1].body, { server: { models_dir: '/x/y' } });
+    });
+    await scenario('a bulk Clear stays off until the table shows the new bytes', { path: '/settings', setup: (s) => {
+      let hold = false;
+      const clearGate = new Promise((resolve) => { s.releaseClear = resolve; }), getGate = new Promise((resolve) => { s.releaseGet = resolve; });
+      s.state.hooks['/v1/prefix-cache/clear'] = async () => { hold = true; await clearGate; return null; };
+      s.state.hooks['/v1/prefix-cache'] = async () => { if (hold) await getGate; return null; };
+    } }, async ({ page, server }) => {
+      await page.waitForSelector('#clearStale:not([disabled])');
+      await page.click('#clearStale');
+      await page.click('#cdOk');
+      await settle(page);
+      server.releaseClear();
+      await page.waitForTimeout(400);
+      assert.equal(await page.isDisabled('#clearStale'), true, 'still pending while the refreshed bytes are on their way');
+      server.releaseGet();
+      await settle(page, 500);
+      assert.equal(await page.isDisabled('#clearStale'), true);
+    });
+    await scenario('an assigned-space box follows the file again once the typing matches it', { path: '/settings' }, async ({ page, server }) => {
+      await page.waitForSelector('#cacheGb');
+      await page.fill('#cacheGb', '5');
+      await page.fill('#cacheGb', '100');
+      Object.assign(server.state.server.prefix_cache_disk_gb, { file: 80, effective_bytes: 80 * GiB });
+      await page.evaluate(() => window.sushiAdmin.refresh());
+      await settle(page, 500);
+      assert.equal(await page.inputValue('#cacheGb'), '80');
+    });
+    await scenario('the confirm dialog is described by its body', { path: '/settings' }, async ({ page }) => {
+      await page.waitForSelector('#clearAll');
+      assert.equal(await page.getAttribute('#confirmDialog', 'aria-describedby'), 'cdBody');
+    });
+    await scenario('Advanced lists the cache columns and each namespace\'s write rate', { path: '/settings', open: { mode: 'advanced' } }, async ({ page, server }) => {
+      await page.waitForSelector('#cacheRows tr button');
+      const heads = await page.$$eval('#cacheCard thead th', (ths) => ths.filter((t) => t.offsetParent).map((t) => t.textContent));
+      for (const want of ['Entries', 'ID', 'Tier use', 'Written', 'Write rate']) assert.ok(heads.includes(want), `column ${want} (${heads})`);
+      const cells = await page.$$eval('#cacheRows tr:first-child td', (tds) => tds.map((t) => t.textContent));
+      assert.ok(cells.includes('37'), `entries ${cells}`);
+      assert.ok(cells.includes('aaaaaaaa'), `id ${cells}`);
+      assert.ok(cells.some((c) => /41\.0 GiB \/ 100 GiB/.test(c)), `tier use ${cells}`);
+      assert.ok(cells.includes('5.00 GiB'), `written ${cells}`);
+      server.state.cache.namespaces[0].tier.written_bytes += 100 * 2 ** 20;
+      server.state.cache.total_bytes += 1;
+      await settle(page, 10_000);
+      const rate = await page.$eval('#cacheRows tr:first-child td:nth-last-child(2)', (td) => td.textContent);
+      assert.match(rate, /^\d+(\.\d+)? MiB\/s$/);
+      assert.ok(Number.parseFloat(rate) > 5 && Number.parseFloat(rate) < 12, rate);
+      assert.match(await page.textContent('#cacheKv'), /Write rate/);
+      await page.click('#modeToggle [data-mode="compact"]');
+      assert.equal(await page.isVisible('#cacheCard th:text-is("Entries")'), false, 'Compact keeps the short table');
+    });
+    await scenario('an assigned space beyond the free disk is flagged', { path: '/settings' }, async ({ page }) => {
+      await page.waitForSelector('#cacheGb');
+      assert.equal(await page.locator('#cacheCard .warn:visible').count(), 0);
+      await page.fill('#cacheGb', '5000');
+      assert.match(await page.textContent('#cacheCard .warn'), /free/);
+      assert.equal(await page.isDisabled('#cacheSave'), false, 'a warning does not block saving');
+      await page.fill('#cacheGb', '100');
+      assert.equal(await page.locator('#cacheCard .warn:visible').count(), 0);
+    });
+    await scenario('Use default names the default size when the server says it', { path: '/settings', setup: (s) => { s.state.server.prefix_cache_disk_gb.default_bytes = 20 * GiB; } }, async ({ page }) => {
+      await page.waitForSelector('#cacheDefault');
+      assert.equal(await page.textContent('#cacheDefault'), 'Use default (20 GiB)');
+    });
+    await scenario('Use default stays plain when the server does not say the default', { path: '/settings' }, async ({ page }) => {
+      await page.waitForSelector('#cacheDefault');
+      assert.equal(await page.textContent('#cacheDefault'), 'Use default');
+    });
+
+    if (failures.length) throw new Error(`${failures.length} admin scenario(s) failed:\n  ${failures.join('\n  ')}`);
+    console.log('Web UI admin views (browser): passed');
+  } finally {
+    await browser.close();
+  }
+}
+main().catch((error) => { console.error(error); process.exitCode = 1; });

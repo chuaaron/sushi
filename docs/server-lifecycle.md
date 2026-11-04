@@ -40,7 +40,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   is newest by date, so a 1.0.x hotfix published after 1.1.0 would be offered to 1.0.4). Never an equal or lower one.
 - **Refused by name**: a source build (under `zig-out/bin`, or in a checkout holding `build.zig`), an app bundle, a
   folder without `lib/`, an unwritable install or parent, another process running from the install (`proc_pidpath`;
-  `--force` skips it), and an install folder holding anything the release does not ship (the swap would carry it off).
+  `--force` skips it; a running `sushibar` does not count, it restarts itself on the new version), and an install folder holding anything the release does not ship (the swap would carry it off).
 - **A Homebrew install** (real path under `/Cellar/sushi/`, any prefix; tap `beamivalice/homebrew-tap`) is brew's:
   `sushi update` and `--rollback` print `brew upgrade sushi` and exit 0, `/v1/update` and `/update` refuse naming it.
 - **Steps**: curl into `<parent>/.<install>.update` (same volume; the tarball resumes), SHA-256 against the `.sha256`
@@ -56,6 +56,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   a retry an hour later. A newer release logs `sushi X is available: run \`sushi update\`` and shows in `/props` and the
   `run` banner. Boot logs `[update] daily check on|off (source)`: `--no-update-check` > off for a source
   build > on. `SUSHI_UPDATE_API` is a test-only hook (tests/test_self_update.sh).
+- **Pack revision** (`pack_update.zig`): the same switch gates a look at the loaded pack's `config.json` on Hugging Face
+  (`SUSHI_HF_ENDPOINT` is the test-only base URL, `tests/test_pack_update.sh`) once after each load (`markReadyLocked`
+  starts a detached thread per pack folder) and then daily, retrying hourly while there is no answer; the repo comes from
+  the pull manifest's `repo` or the folder name's match to an alias. `/v1/models` carries the result as
+  `meta.pack_update`; a 401/403/404, a timeout or a bad body claims nothing.
 - **Update and restart** (`/v1/update`, the REPL's `/update`): the server shuts down through its SIGTERM path, then
   main's last defer REPLACES the process (`posix_spawn` with `SETEXEC | CLOEXEC_DEFAULT`, fds 0-2 kept) with
   `sushi update --relaunch -- <argv>`, which in turn replaces itself with `<install>/sushi <argv>`, new or restored.
@@ -80,6 +85,32 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - `serve`, `--serve`, `--host`, `--port`, and `--tool on` conflict with explicit prompts and fail before loading.
   Use the REPL for client-side tools. Guard: `tests/test_prompt_flags.py`; `SUSHI_PROMPT_MODEL` enables live Qwen checks.
 
+<a id="startup"></a>
+## Startup order
+
+A `--model` boot (`server.serve`) serves before its model is loaded:
+1. `ensurePortFree` (main.zig, before the config is read), then the listener binds.
+2. `Scheduler.init` claims the launch model's registry entry (`claimStartupLoad`: `loading`, the claim's reference,
+   its gate estimate) and spawns the inference thread, which runs the load's refusals: arch gate, launch-flag and KV
+   refusals, the streaming plan (`ExpertStreamingRequired`, the budget refusals), the memory preflight (context and
+   weights). `init` returns at `model_load.signalPrechecked`, just before the weights, so a refusal still exits
+   non-zero before anything is served, with the same message.
+3. The gauge sampler starts, `Server listening on …` is logged and the accept thread (`acceptLoop`) starts. Requests
+   are answered while the rest of the load runs ([server-http-apis](server-http-apis.md#during-the-load)).
+4. `awaitStartupLoad`. A failure here logs `[scheduler] model load failed: <name>`, answers every waiting request
+   with that error, stops the accept loop, drains the connection threads and exits non-zero (`error: LoadFailed`).
+   The server never stays up without its launch model: scripts and the app read the exit as the load's verdict.
+5. After the load, as before: the request hooks, idle eviction, the cache and `Concurrency:` lines, the SIGINT/SIGTERM
+   handlers, `on_ready`, the pinned context, the route list and `chat in your browser:`. Then `releaseStartupPin` and
+   `boot_gate.process.open`: a request that got the model earlier waits at the gate for this step, so it never runs
+   before the context is pinned or the hooks are in.
+- The signal handlers stay after the load: until then SIGTERM (and `--parent-pid`) ends the process at once, as a
+  load cannot be cancelled.
+- `SUSHI_TEST_LOAD_DELAY_MS` holds the startup load after its refusals (test seam, [envvar](envvar.md)). Guard:
+  `tests/test_early_listener.sh`.
+- Headless (`--model-dir`, no `--model`) and the embedded bench client (no listener) take the same path with nothing to
+  wait for.
+
 ## What loads
 
 - A rescan makes a failed load retryable only when discovery finds the same ID at the same path; it clears the error and refreshes the on-disk byte count without disturbing live entries.
@@ -98,6 +129,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - The arch gate: the loader refuses any `model_type` outside `model.served_model_types` (`qwen4_exp`, `mimo_v2`, `glm5_next`, `deepseek_v41`) by
   name (`ArchitectureUnsupported` → 503). A checkpoint in an unsupported file format is refused by name
   (`ModelFormatUnsupported` → 503; `--model` exits).
+- The pack-revision check is the first thing `loadWeightsForConfig` does after the arch gate, for every arch: a config
+  that names `pack_revision` and a shard (MTP shards included) that carries another revision or none is refused
+  `PackRevisionMixed` (503 `pack_revision_mixed`; the log names each file) before any weight bytes load
+  ([pack-format](pack-format.md#pack-revision)). `sushi pull` ([usage](usage.md)) compares checksums, not sizes
+  (`src/hf_pull.zig`); the HF address is built in one place, `hf_pull.hfUrl`, over `hf_pull.endpoint()`.
 - **The weight loader is ONE decision** (`model.loadWeightsForConfig`: streaming index > MiMo source trunk > vision >
   plain). A second site builds a model the server never serves — a MiMo pack read without its source trunk binds the
   raw FP8 fused QKV and its logits stop following the routed experts.
@@ -108,6 +144,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - Discovery (`src/model_discovery.zig` / `src/model_registry.zig`): two-level org/name, multi-root, streaming stubs,
   multi-model registry. **`--model-dir` is REPEATABLE** (`discoverModelsMany` merges roots FIRST-WINS). One path never
   registers under TWO ids (`registry.peekByPath`).
+- **Discovery never lists a dot folder or a folder named `test-fixtures` BELOW a root**, at either depth (`skipsBelowRoot`;
+  one debug line per skipped fixtures folder). The repo's tiny test models live in `${SUSHI_MODELS_DIR}/test-fixtures/<name>`
+  and are not packs to serve. A root the user NAMES is always scanned (`--model-dir .../test-fixtures` lists them), and
+  `--model <path>` never goes through discovery; rescan shares the rule.
 - **The auto `--max-resident-mem` (80% of the GPU working-set limit) bounds CO-RESIDENCE only**: a cold load evicts
   every other model first, and one that then loads alone is the load preflight's call (`mem_cap_binds_alone`); an
   explicit `--max-resident-mem` binds a sole model too. Before this the 2.3bpw MiMo pack could not cold-load through
@@ -145,14 +185,18 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   outranks the default; a file value counts as the operator's own number (no formula sizing). `main.zig` records which
   flags were given (`model_settings.launch_locks`), and `GET /v1/settings` reports those keys locked. The web UI edits the
   file through `POST /v1/settings` (validated, temp file + rename, [server-http-apis](server-http-apis.md#ssd-prefix-cache-and-settings-v1prefix-cache-v1settings));
-  `model_settings.model_keys` is the one list of editable per-model keys. `SUSHI_MODELS_DIR` is a test variable the engine does not read.
+  `model_settings.model_keys` is the one list of editable per-model keys, and the loader applies exactly the values its `validate` accepts
+  (one parse and one range: a hand-edited `ssd_budget_gb` over 512 is unset to both). The SSD ask (`server.diskAsk`) is atomic: the settings POST
+  writes it from a connection thread, and every load, cold loads and their checkpoint stride included, reads it at load time rather than a boot snapshot.
+  A key that does not apply to an arch (`model_settings.applies`) is logged as ignored at load and listed as not applying by `GET /v1/settings` and `/props`
+  (`settings.mtp.acceptance_applies`); `ssd_prefetch` also logs that it is ignored on a DeepSeek pack without STQ experts. `model_settings.Fit` (built by `server.settingsFit` from a loaded config, by the settings API from a stub's files) is the one set of facts behind `applies`, `limit` and `refuseEdits`; add a gate there, never in the page. A `kv_quant` file value GLM's latent cannot store (4) is dropped at stamping with a warning, never a refused load. `SUSHI_MODELS_DIR` is a test variable the engine does not read.
 - **The prefix cache's other tiers are launch flags only**: RAM retention is off unless
   `--prefix-cache-mem` is given with a size (`off` or `0` keeps it off), and the SSD tier is on unless `--prefix-cache-disk 0`
   or `--prefix-cache-entries 0`, sized per model at load ([engine-prefix-cache](engine-prefix-cache.md#defaults)); its size alone has the
   `server.prefix_cache_disk_gb` key.
 - A new per-model setting or launch flag follows this order, carries an `*_explicit` bit through both load sites and
   cold loads, and logs its resolved value with its source at load.
-- Load-time context bills see explicit KV and MTP choices before `Scheduler.init` returns, including `--no-mtp`.
+- Load-time context bills see explicit KV and MTP choices from the load's start (`serve` publishes them before `Scheduler.init`), including `--no-mtp`.
 
 ## Scheduler and batching
 
@@ -206,6 +250,19 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   (also one landing after prefill, `postPrefillTerminal`), failed prefill), not when its connection thread completes it: an errored request's reserve once held 11 GB.
 - `src/generate.zig`: generation, `commitForcedTokens`; `src/mtp_policy.zig` / `src/mtp_round.zig`: MTP policy and rounds; `src/sampler.zig`: sampling;
   `src/prefill_plan.zig`: prefill chunking; `src/degenerate.zig`: `StallClock`, loop-stop tiers. `src/tokenize_cache.zig`: per-LoadedModel LRU of rendered+encoded prompts.
+
+## sushibar
+
+`sushibar` (`src/sushibar_main.zig`, `src/sushibar/`) is a separate pure-Zig binary: the Objective-C runtime and AppKit, no MLX, jinja or server module (only `default_port.zig` is shared with `server.zig`).
+
+- **Launch**: bad arguments and an ssh login (`SSH_CONNECTION`/`SSH_TTY`) are refused by name before anything runs; a live `~/.sushi/sushibar.pid` (verified as a `sushibar` process) prints "already running" and exits 0. The detached copy holds an `flock` on `~/.sushi/sushibar.lock` for its life (an `exec` relaunch takes it again), so two launches at the same instant leave one sushibar. Otherwise the terminal copy spawns itself with `POSIX_SPAWN_SETSID` (a session leader is the detached copy), waits for it to take the pid file, prints one line and exits 0.
+- **Menu**: a header card (a custom `NSView`, `header_view.zig`; strings, rows and sparkline points come from `sushibar_logic.zig`) over system-symbol items. The card shows the icon (colour online, outline offline), `sushi <version>` with ` · server X` when the running server's version differs, then ` · up to date` or ` · X available` (accent colour), a status pill (Running, Loading, Stopped, Not answering, Key needed, Metrics off, Updating…; Not answering is a sushi that holds the port and does not reply, and Stop is offered), the model with `Port N · X GB in use` (or No model loaded, Not running, API key required) and, when the loaded model's `/v1/models` row has `meta.pack_update`, an accent line `Pack 2.0 available (you have 1.0)` under the model name, and, while a model is loaded, DECODE, PREFILL and GPU MHZ columns (`gpu_clock_mhz`, `gpu_utilization_pct`) over a five-minute decode sparkline from `/metrics.json?since=` history, drawn in the accent colour with gaps where the server was down. It refreshes in place while the menu is open (the timer runs in the common run-loop modes). Below it: Start Server / Stop Server (Stop Server… when sushibar did not start it, Starting…/Stopping… while it changes), Port N with its submenu, Dashboard, Chat, Models, Settings (⌘1-⌘4, disabled while nothing answers), the update group (with Copy “sushi pull …” while a pack update waits: a pack is hundreds of GB, so the menu never pulls it) with, under it, a disabled note line that carries the last update or start failure (cut to about 100 bytes with an ellipsis; Check for Updates is hidden while an update waits, so a failure is never written only there), Quit sushibar (⌘Q). Light and dark are checked with `SUSHIBAR_RENDER_HEADER=<dir>` ([envvar](envvar.md)).
+- **Title**: polled once a second off the main thread from `/metrics.json?since=<ms>`. Live = tokens added to the `decode` rows of `sessions` (same `request_id`) over the wall time between polls; idle = `generated_tokens / decode_seconds` of the newest finished row of `requests`, drawn dim; 401/403 reads "key needed", 503 "metrics off", no answer (a poll times out after 4 s) is offline. The title is in monospaced digits, a dot follows it while an update waits, and the status line is its tooltip. The icon is an outline while offline and in colour once any server answers (`icon-offline.svg`, `icon-online.svg`, embedded; swapped only on a state change). AppKit runs only on the main thread, which renders the published snapshot from a run-loop timer.
+- **Start/Stop**: the item reads Start Server or Stop Server (the header and the Port item name the port). Start runs the `sushi` beside the executable as `--serve --port N` (no model flags, so the saved `server.models_dir` applies) in its own session and records `~/.sushi/sushibar-server-<port>.pid` (`pid port`), one file per port; a server that exits before it ever answered shows "Server on port N did not start: see ~/.sushi/logs/sushi-N.log" in the note line (sushibar reaps only the pids it started); it is disabled while another program holds the port (a connect succeeds and no sushi listens) and when no `sushi` sits beside sushibar. Stop on a server sushibar started sends SIGTERM to its pid at once, while that pid is still a `sushi` whose argv has `--serve --port N`. Stop on any other sushi listening on the port asks first (an NSAlert naming the port and pid), then re-scans and signals that one verified pid; only an executable named `sushi` that listens on the watched port is ever signalled. The listener scan is libproc (`proc_listpids`, `proc_pidinfo` fd list, `proc_pidfdinfo` socket info: a TCP socket with a local port and no foreign port), no sudo and no `lsof`. Quit ends sushibar alone.
+- **Port**: the Port submenu lists every sushi listening (label "N — model", a check on the watched one). The watched port is polled on its own deadline every second; a sushi on another port is asked for `/v1/models` only when the submenu opens (all in parallel, 1 s timeout, never on the poll thread), so a hung sushi elsewhere cannot slow the watched poll and sushibar does not keep hitting other servers. A listener not yet asked reads "…", one that did not answer reads "not answering", never "no model" and, last, a field (`port_field.zig`, a custom menu-item view: label, text field, Watch button). Return or Watch on a valid number (1-65535) switches the watched port and closes the menu; anything else turns the text red with a "1–65535" hint and keeps the menu open. A click inside the field makes the menu window key so it takes typing. The choice is saved in `~/.sushi/sushibar.json`; an explicit `--port` beats it, which beats sushi's default port. A server sushibar started on another port stays tracked by its own pid file.
+- **Version and update**: the menu shows `sushi <version>` of the sibling binary (`sushi --version`, at launch and after an update) and the running server's version when it differs. A check is `/props.update` of a running server (once a day, never GitHub from sushibar) or `sushi update --check` (no server; at launch, then once a day, an hour after a failure; sushi's own ETag cache applies). A failure is the CLI's last `update:` or `error:` line, never a log header. A server update that does not finish is reported after two minutes, and following it stops when the watched port changes; "Check for Updates" always runs the CLI. A newer release adds "● Update to sushi X" and a dot after the title. With a server on the watched port the update is `POST /v1/update` (Origin `http://127.0.0.1:<port>`, as the page sends) and sushibar follows the page's flow (health down, back up, `/props.update.current`/`error`); with none it runs `sushi update` and shows the updater's own refusal (another sushi from the install folder blocks it by pid; a running sushibar does not). A Homebrew keg or `/props.update.command` shows `brew upgrade sushi` with a Copy Command item and no update button. Whenever the sibling's `sushi --version` differs from the one sushibar launched with (re-read at each check, after an update and when the server's version changes), whatever replaced it, sushibar re-executes itself (same pid, `--port N`). sushibar keeps the path it was started by and resolves it with `realpath` at each spawn, so a Homebrew `bin/sushibar` symlink finds the current keg's `libexec/sushi` (brew's `opt/sushi/libexec` link when the keg is gone), is recognised as a brew install, and survives `brew upgrade` deleting the keg it started in; the relaunch execs the same unresolved path. Each captured command writes its own file under `~/.sushi/`.
+- Test seams: `SUSHIBAR_TEST_POLLS`, `SUSHIBAR_TEST_ACTIONS` ([envvar](envvar.md)); they print only what the menu shows (a hidden item is not printed); guard `tests/test_sushibar.sh`.
+- **PREFILL** in the card is `(prompt_tokens - cached_tokens) / prefill_seconds` of the newest finished (`ok`) request; a request served wholly from the cache shows none.
 
 ## Threads
 

@@ -68,10 +68,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   default (undefined: every turn's thinking kept). Off renders only the latest user turn's thinking.
 - `tool_choice` reads every surface's wire shape; `required`/`any` and a named function are enforced at decode, a
   named function the request does not declare is a 400 ([server-tool-calling](server-tool-calling.md#tool_choice)).
+- `/v1/models` `bytes_on_disk` is the bytes the pack reads, symlinked shards included; `bytes_linked` (0 when none) is the part
+  that comes through symlinks to files outside the pack folder (a symlink inside it counts as the pack's own), so disk use is
+  `bytes_on_disk - bytes_linked`. The Models tab details show it as "linked from elsewhere".
 - `/v1/models` rows carry `context_length` + `max_model_len` at TOP level. Context-overflow 400s name BOTH counts.
 - A prompt that tokenizes to zero tokens is a 400 `invalid_request_error` and never reaches generate: completions
   refuse it after tokenizing, `Scheduler.submit` refuses it for every surface (`error.EmptyPrompt`), and
   `Generator.initWithOptions` returns that error rather than index the prompt's last token.
+- `/v1/models` `meta.pack_update` (`{"current":"1.0","latest":"2.0","command":"sushi pull deepseek-v4.1-flash"}`) is present on a loaded model's row only while Hugging Face publishes a higher `pack_revision` of its pack ([usage](usage.md#sushi-pull-and-sushi-list)); absent otherwise, offline, or under `--no-update-check`. The check (`pack_update.zig`) runs on its own thread after the load and then daily, never on the inference thread; `sushibar` and the Models tab show it.
 - `/v1/models` `meta.quantization` reports EXL3’s configured expert rate and dense width (e.g. `EXL3 3bpw experts, 8-bit dense`) for loaded and unloaded packs; affine labels remain `{bits}-bit`, and `/props` numeric quantization fields retain their dense-trunk meaning.
 - Endpoint EXISTENCE never depends on model state and the 404 is answered BEFORE the model resolves (`ROUTE_PATHS`);
   a status route never reaches `ensureLoaded` (`handlePropsNoModel`). Removed upstream routes answer named 404s.
@@ -86,6 +90,24 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   a failure is a 400 naming the message index and the reason, an `input_audio` part a 400 on a model without an
   audio encoder, more than 1024 images a 400 with both counts, an encode failure a 500 (Anthropic: `api_error`).
   Stored Responses history keeps text only.
+
+<a id="during-the-load"></a>
+## During the launch model's load
+
+A `--model` boot listens once the load has passed its refusals ([server-lifecycle](server-lifecycle.md#startup)), and
+answers while the weights load:
+- **`/health` reports the boot** (`boot_gate.healthFor`): 503 `{"status":"loading"}` during the load, 200
+  `{"status":"ok"}` once the model is ready and its boot is done, 503 `{"status":"error"}` while a failed boot exits.
+  A readiness poll (the `run` REPL, `tests/lib/boot.sh`, scripts, load balancers) thus waits for the model as it did
+  when the port opened only after the load; a liveness probe reads any answer. Headless boots answer 200 at once.
+- The page (`/`, `/chat`, `/dashboard`, `/models`, `/settings`), `/v1/models` (the launch model's row has
+  `"state":"loading"`), `/props` (the no-model body with the live memory counters), `/metrics`, `/metrics.json`,
+  `GET`/`POST /v1/settings`, `GET /v1/prefix-cache`, the stored Responses routes and `/v1/models/rescan` answer at once.
+- A generation request (and `/tokenize`, `/detokenize`, `count_tokens`, `POST /v1/load-model` for the launch model)
+  waits in `ensureLoaded` for the load, as for a cold load, then at the boot gate until the context is pinned; a
+  failed load answers it with the load's named error (`sendLoadFailedResponse`, `sendNamedLoadRefusal`). A
+  prefix-cache clear waits for the inference thread, so for the load; `/v1/update` is refused as busy.
+- Guard: `tests/test_early_listener.sh`; the `boot gate:` and `ModelRegistry: a launch model claimed …` unit tests.
 
 ## Streaming
 
@@ -123,6 +145,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
 - **NO string built from model bytes is guaranteed UTF-8**: sanitizing lives INSIDE the escaper (`chat.utf8Next`
   under every `jsonEscape`/`appendJsonString`); logprobs `bytes` keeps the exact bytes. Hand-written error text is
   escaped at the SINK.
+- **A name the server did not write enters a JSON body through `json_text`** (`Str` in a `{f}` slot, `innerAlloc` for a slot inside quotes): a model id or error name in `/v1/models`, `/props` and the load/unload answers, the echoed request `model` of the chat, completion and Anthropic answers, and the flag text of a `/props` setting. A folder named with a quote or a backslash lists as valid JSON.
 
 ### Closing a streamed response
 
@@ -247,7 +270,13 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
 - A request reader waits at most `REQUEST_READ_LIMIT_MS` (30 s) between bytes and for its whole head, then drops the connection without a reply, so a silent or dripping client never holds its thread; a `Content-Length` sums into the size check with saturating arithmetic, so a wrapping value is a 413 instead of a small allocation.
 - A schema `pattern` repeat count is at most 1000 and its NFA at most 32768 states (`regex.zig`); past either, `compile` fails with `InvalidPattern`.
 - Metrics are ON by default (`--no-metrics` is the opt-out; `--metrics` is accepted and does nothing); TTFT at prefill completion; live tok/s via ONE atomic per tick; `/metrics(.json)`. Cost with metrics on: per request a handful of relaxed atomic adds at `finishSlot`; per decode tick one atomic store (`inflight_generated_tokens`) and the live-session rows (`publishLiveKvResidency`: one clock read and a ~200 B row copy per decoding slot, under the `queue_mu` hold the cull already takes); per prefill chunk one atomic store and the same row publish; every 2 s the sampler thread (two MLX allocator counter reads, two syscalls, one brief `queue_mu` hold, one ring push). Nothing runs per token. With `--no-metrics` none of it runs.
-- **History ring**: the sampler also pushes one sample per 2 s tick (the token gauges only move once per tick) into `metrics_history.process`, a fixed ring of 1800 samples (one hour, 56 B each, about 100 KB static, no allocation). `GET /metrics.json?since=<unix ms>` adds `"history":{interval_ms,capacity,started_ms,fields,samples:[[t_ms,gen_tokens,prefill_tokens,running,waiting,prefilling,batched,gpu_pct,memory_mb,mlx_active,mlx_cache],...]}` with the samples newer than `since` (`since=0` is everything kept); `started_ms` is the first sample's time, which the page reads as the server's start for its uptime; without `since` the feed is unchanged. The dashboard backfills from it when it was in the background and plots by `t_ms`, so a hidden tab leaves no gap and a real gap (server down) is drawn as one.
+- **History ring**: the sampler also pushes one sample per 2 s tick (the token gauges only move once per tick) into `metrics_history.process`, a fixed ring of 1800 samples (one hour, 64 B each, about 100 KB static, no allocation). `GET /metrics.json?since=<unix ms>` adds `"history":{interval_ms,capacity,started_ms,fields,samples:[[t_ms,gen_tokens,prefill_tokens,running,waiting,prefilling,batched,gpu_pct,memory_mb,mlx_active,mlx_cache,gpu_mhz],...]}` with the samples newer than `since` (`since=0` is everything kept); `started_ms` is the PROCESS start (stamped at `main` entry, so it stays right after a `POST /metrics/enable` on a `--no-metrics` boot; a host that never stamps it falls back to the first sample's time), which the page reads as the server's start for its uptime; without `since` the feed is unchanged. A client reads the columns by `fields` name, new ones are only ever appended. The dashboard backfills from it when it was in the background and plots by `t_ms`, so a hidden tab leaves no gap and a real gap (server down) is drawn as one.
+- <a id="gpu-clock"></a>**GPU clock** (`gpu_clock_live.zig`, no sudo): the gauge sampler reads IOReport's `GPU Stats / GPU Performance States` residency and weights each P-state's frequency by it (OFF excluded, so a fully idle window is 0). The frequencies are the `voltage-states9` pairs of the `pmgr` registry entry (Hz or kHz, normalised to MHz; P14 and up clamp to the top row). `/metrics.json` gauges `gpu_clock_mhz` (the window since the previous sample) and `gpu_clock_max_mhz` (the table's top, constant per boot; 0 when the clock cannot be read), Prometheus `sushi:gpu_clock_mhz` and `sushi:gpu_clock_max_mhz`. `sushi bench` opens its own reader of the same source for the throttle verdict.
+- **Finished-request log** (`request_log.zig`): `finishSlot` and the cleanup drain push one row per request into `Metrics.finished`, a fixed ring of 128 rows (about 30 KB static, no allocation) behind one mutex: a few field copies per finished request, nothing per token, and nothing at all on a `--no-metrics` boot (the ring lives in the metrics core, so a runtime enable starts it empty). It rides the same `?since=` as the history: `GET /metrics.json?since=<unix ms>` ends with `"requests":[...]` after `"history"`, the rows finished after `since`, oldest first; without `since` the key is absent. A full array (128 rows) may have dropped older rows. Each row: `{"request_id":42,"model":"<id>","t_ms":1762100000123,"prompt_tokens":70,"cached_tokens":30,"prefill_seconds":0.25,"generated_tokens":7,"decode_seconds":1.5,"outcome":"ok"}`.
+  - `request_id` is the `sessions` row id. `t_ms` is the server wall clock of `history` samples and strictly increases across rows (a tie is bumped by 1 ms), so polling with `since=<newest t_ms>` neither skips nor repeats a request.
+  - `prompt_tokens` are the tokens the model computed (prompt minus restored); `cached_tokens` are the ones restored from the prefix cache. The prompt is their sum.
+  - `prefill_seconds` is `Slot.prefill_ns`: the lookup and restore of the prefix cache (the SSD tier included) plus the forward over the uncached tail, minus decode ticks interleaved into it and without the queue wait; 0 when the request ended before its prefill finished. A restore-heavy row therefore reads a lower prompt speed than the forward ran at. `decode_seconds` is the slot's decode wall time (a batched tick counts whole for every slot in it), so `generated_tokens / decode_seconds` is the speed the client saw.
+  - `outcome`: `ok`, `cancelled` (disconnect or cancelled in prefill), `error` (a generation or latched MLX failure), or `rejected` (refused before its first forward: `PrefillDoesNotFit`, `MediaRefused`; zero tokens). A refusal before a slot exists (context overflow, memory preflight) has no row; `sushi:request_rejected_total` counts it. Rows are recorded where the counter outcome is (`recordSlotEnd`/`recordSlotCleanup`), so each request appears once.
 - **Metrics at runtime**: `POST /metrics/enable` turns the same core on in a server booted with `--no-metrics` (200
   `{"metrics":true,"already_enabled":false}`, and `true` on every later call: idempotent; any other method is a 405). There is
   no off switch. It sits behind the `--api-key` gate like the other mutating routes and refuses a foreign `Origin` (403, same
@@ -308,33 +337,71 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
 - `GET /v1/prefix-cache`: `{root, volume:{free_bytes,total_bytes}|null, total_bytes, namespaces:[{id, bytes, entries,
   newest_mtime (unix s), model|null, stale, held_by_other_process, tier:{used_bytes,cap_bytes,entries,written_bytes}|null}]}`.
   A namespace is a `<16 hex>` directory of the cache root (`SUSHI_PREFIX_CACHE_DIR`, else `~/.sushi/kv-cache`) holding
-  `e<id>` entry directories (a private `p<pid>-<n>` root inside it counts too). `bytes` is the size on disk with a
-  hard-linked file counted once; `entries` counts entry directories with a `meta.json`. `model` is the loaded model whose
+  `e<id>` entry directories (a private `p<pid>-<n>` root inside it counts too). `bytes` is the apparent size (the sum of the
+  files' lengths, not disk blocks) with a hard-linked file counted once; `entries` counts entry directories with a `meta.json`. `model` is the loaded model whose
   tier lives there (and `tier` its live numbers, published by the inference thread); `stale` means no loaded model uses it
-  and no other server holds its lock (`held_by_other_process`). A symlink or a folder that is not a namespace name is never listed.
+  and no other server holds its lock, or the lock of a private `p<pid>-<n>` root inside it (`held_by_other_process`). A symlink or a folder that is not a namespace name is never listed.
   `tier.written_bytes` is cumulative since the tier opened; a client takes the write rate between two polls.
-- `POST /v1/prefix-cache/clear` `{"scope":"model","model":id}` | `{"scope":"stale"}` | `{"scope":"all"}` answers `{scope,
+- `POST /v1/prefix-cache/clear` `{"scope":"model","model":id}` | `{"scope":"namespace","id":"<16 hex>"}` | `{"scope":"stale"}` | `{"scope":"all"}` answers `{scope,
   freed_bytes, model_freed_bytes, model_entries_removed, stale_freed_bytes, stale_namespaces_removed,
   skipped_live_namespaces, refused_symlinks, busy_models}`. `model` empties that model's tier on the inference thread (its
   sole owner): staged writes are fenced, the index, `total_bytes` and the files go together, and the tier takes new writes
   at once. It is refused with 409 `model_busy` while a request holds the model (retry; it is not queued), and 409
   `model_not_loaded` for a model without a tier. `stale` deletes the namespace directories no loaded model uses, each under
   the root's lock (a root another server holds is skipped), and never follows a symlink out of the cache root. `all` is both,
-  with busy models listed and left alone.
+  with busy models listed and left alone. A `model` scope needs a string `model` (400 without one: the empty id would
+  mean the default model). `namespace` deletes exactly that namespace directory under the same locks as `stale`, so a
+  namespace another server holds is skipped (`skipped_live_namespaces: 1`, nothing removed) and a symlink is refused;
+  it answers the `stale_*` fields of the namespace it removed, 400 for an id that is not a namespace name, 404 for
+  one not in the cache and 409 `namespace_in_use` for one a loaded model owns (use `model`).
 - `GET /v1/settings` reports `~/.sushi/model-settings.json` as the page edits it: `server.models_dir` and
-  `server.prefix_cache_disk_gb` (`file`, `flag` when a launch flag pins it, `source` `flag|file|default`, `locked`), the
+  `server.prefix_cache_disk_gb` (`file`, `flag` when a launch flag pins it, as typed: `models_dir` whole, the size in the
+  flag's own syntax such as `512MB`, `source` `flag|file|default`, `locked`; the size also carries `effective_bytes`, the
+  largest running tier's cap or, with none running, the ask; `ask_bytes`, the number the next load starts from; `default_bytes`, the size an unset key asks for (a load may
+  take less to fit its context or the free space); and
+  `running_tiers`, `[{model, cap_bytes, used_bytes}]`), the
   `model_keys` metadata (type, range, choices) and, per registered model, each key's `file` value, `flag`, `source` and
-  `locked`. `POST /v1/settings` takes `{"server":{key:value|null}}` and/or `{"model":id,"set":{key:value|null}}`; null removes
-  a key. Unknown keys are a 400 `unknown_setting`, a bad value a 400 `invalid_setting`, a `models_dir` that is not a readable
+  `locked`. A pinned `mtp_acceptance` reports the flag as typed with its value (`--mtp-tokenv3 0.5`, `--mtp-typical 0.3`) and `mtp_greedy_tail` reports `--mtp-greedy-tail`; the other model keys report their value alone. `POST /v1/settings` takes `{"server":{key:value|null}}` and/or `{"model":id,"set":{key:value|null}}`; null removes
+  a key. Each model row also carries `keys`, the keys that apply to that model (`model_settings.applies`, the same gates
+  the loader's ignored-key log lines use: `ssd_budget_gb` needs expert streaming, `ssd_prefetch` is DeepSeek-V4.1's,
+  `kv_quant`, `mtp_acceptance` and `mtp_greedy_tail` are not DeepSeek-V4.1's, `vision` needs a tower), and `loaded_with`,
+  null while the model is not loaded and otherwise `{key: value|null}` for every key: the file value the load stamped
+  (null: the file had none then), in the shape of `settings.<key>.file`, so a page tells "saved differs from loaded".
+  Each row also carries `limits`, an object holding an entry only for a key the model constrains (`model_settings.limit`, read
+  from the same `Fit` the loader's gates use): `disabled: true` (the loader ignores the key; every key missing from `keys` has
+  one), `choices` (the subset a choice key takes: GLM's `kv_quant` is `off|6|8`, the widths its MLA latent stores), `max`
+  (`ctx_size`: the model's context window, YaRN-aware), `requires: {"mtp": true}` (`mtp_acceptance`, `mtp_greedy_tail`: read
+  only while `mtp` is not false, unset counting as on) and `unset: ["ssd_budget_gb"]` (a key the pack ignores while an SSD
+  budget makes it stream, because its MTP head cannot run then), each with a one-sentence `why`. A POST for a model refuses
+  with a 400 `invalid_setting` naming the key and the reason a non-null value of a disabled key, a choice or integer outside
+  its limit, and a set key whose `requires`/`unset` fails against the file plus the request; removing a key and any value
+  already in the file pass, and the loader still never refuses a load over the file. Not in `limits`: bounds that need the
+  machine's memory or the pack's weight bill (the smallest `ssd_budget_gb`, a tower beside a small budget, the memory-safe
+  `ctx_size`); the load refuses those by name.
+  `kv_quant` is a choice name (`off`, `4`, `6`, `8`) wherever it is read or written; a request may say `0`, `16`, `"16"` or `"off"`
+  and the file stores `"off"`. Unknown keys are a 400 `unknown_setting`, a bad value a 400 `invalid_setting`, a `models_dir` that is not a readable
   folder a 400, an unknown model a 404, a settings file that is not a JSON object a 409; every key is checked before anything
-  is written, and the write is a temp file plus rename. A key a launch flag pins is still written (it applies at a start
+  is written, and the write is a temp file plus rename (through a symlinked settings file, to its target; a model section is found
+  without regard to a trailing slash in its key). A key a launch flag pins is still written (it applies at a start
   without the flag) and reported with the flag's source. Per-model keys are stamped at load, so they apply at the model's next
   load (the page offers the reload). `prefix_cache_disk_gb` reaches the running tiers at once (the tier re-derives its budget
-  and evicts down to it); 0 and removal apply at the next load. `models_dir` triggers a rescan that adds the folder's models
-  (add-only; the boot discovery follows it at the next start).
-- The page shows both in its **Models** (`/models`: per-model size, load/unload, settings, that model's cache) and
-  **Settings** (`/settings`: SSD cache size, status, per-namespace rows and the clear buttons, models directory) views.
-  Guards: `tests/test_prefix_cache_admin.sh`, `node tests/test_webui_admin.cjs`.
+  and evicts down to it) and every later load, cold loads included; the answer says "applied to the running tiers" only
+  when a tier was resized, else "applies at the next model load"; 0 and removal apply at the next load. `models_dir`
+  triggers a rescan that adds the folder's models, also on a `--model`-only server, and says how many (add-only; the boot
+  discovery follows it at the next start).
+- The page shows both in its **Models** (`/models`: a list with a detail form per model: size, load/unload, settings, a
+  model's cache) and **Settings** (`/settings`: SSD cache size and use, per-namespace rows with their own Clear, the clear
+  buttons, models directory, version) views. The page is served by the same build as the API, so it reads these fields
+  without fallbacks: per model `keys` (which settings the model has), `loaded_with` (what the loaded model started with,
+  for the reload prompt) and `limits` (per key: `disabled`, `choices`, `max`, `requires`, `unset`, each with a `why`
+  the page shows on the row; a key outside `keys` with a `disabled` limit shows greyed in Advanced), `kv_quant` as
+  `off|4|6|8`, `server.*.flag` as the flag's own text, `server.prefix_cache_disk_gb.ask_bytes`, and `POST
+  /v1/prefix-cache/clear {"scope":"namespace","id":...}`. A `flag` is printed as the server sends it: a text starting with `--`
+  (`--mtp-tokenv3 0.5`) is the flag's whole spelling, anything else is the value the page puts after the flag's name; a locked
+  choice shows the choice the spelling names, else "Launch flag". The page names "Use default (N GiB)" from
+  `server.prefix_cache_disk_gb.default_bytes`. The Settings write rate is the difference of two `tier.written_bytes` polls per namespace (no
+  `/metrics.json` read, which is 503 while metrics are off). Guards: `tests/test_prefix_cache_admin.sh`,
+  `node tests/test_webui_admin.cjs` (pure functions), `node tests/test_webui_admin_ui.cjs` (the tabs against a stub).
 
 ## Chat page (`GET /`, `GET /chat`, `GET /dashboard`, `GET /models`, `GET /settings`)
 
@@ -342,33 +409,51 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   `@embedFile` and served as `text/html; charset=utf-8`. Any other method on those three paths is a 405 answered BEFORE
   model resolution, so it can never cold-load a model. `GET /dashboard` serves the same page and is open under
   `--api-key` like the other two. Guards: `tests/test_webui.sh`, the `chat page:` and `dashboard page:` tests.
-- A **Chat | Dashboard** navigator in the top bar switches two views of that one page in place (`history.pushState`,
+- The root `/` lands on the Dashboard (`viewOf` maps it there), `/chat` is the chat. A **Dashboard | Chat | Models | Settings** navigator in the top bar switches the views of that one page in place (`history.pushState`,
   `popstate` for Back/Forward). The chat panel is hidden with `inert` and `visibility`, never detached, so the open
   conversation, a streaming answer, the composer, the scroll position and the API key overlay survive a switch.
+  Cmd+1..4 (Ctrl+1..4 off a Mac) click the four tabs in that order, so unsaved Models/Settings edits still ask; they do
+  nothing behind the API key overlay or an open dialog. A browser that reserves those keys for its own tabs keeps them.
+- **One reader of `/v1/models`**: `modelStore` (main script) polls it (30 s on Chat, 5 s on Dashboard and Models, 4 s
+  while the server is unreachable, 2 s while a load is pending) and notifies subscribers (top-bar status, chat model list, dashboard strip, Models tab) only
+  when the answer changed; no timer runs while the tab is hidden, and loads and unloads go through its `act`. There is
+  no separate `/health` poll. `confirmAction` is the one confirmation dialog (destructive buttons name the bytes they free).
 - The dashboard (ported from @cosmic-quokka's contribution, #55) polls this server's own `/metrics.json`,
-  `/v1/models` and `/props` with the chat's stored API key as `Authorization: Bearer`, at 2 s or slower. The live
+  `/v1/models` (through `modelStore`) and `/props` with the chat's stored API key as `Authorization: Bearer`, at 2 s or slower. The live
   charts need metrics: without them the page says so, shows an **Enable metrics** button (only while `/metrics.json` answers
   503; it `POST`s `/metrics/enable` with the chat's key, then polls at once, so the charts start without a reload and the
-  button goes away; a refusal leaves the button and says why), and the Models table still works. While hidden it polls only
+  button goes away; a refusal leaves the button and says why), and the page says metrics are off instead of drawing empty charts. While hidden it polls only
   `/metrics.json`, and only when no chat request is in flight and the browser tab is visible. Switches and tab
   returns keep the 2 s minimum between polls; a transient error backs off (2 s doubling, up to 30 s), while a 503 or
   401 stops the hidden poll until the dashboard is shown again. It follows the chat's
-  theme. Guard: `node tests/test_webui_dashboard.cjs` (headless Chromium through Playwright; skips if absent).
+  theme. The GPU chart (Compact and Advanced) draws the clock (left axis, 0 to `gpu_clock_max_mhz`, idle windows are gaps) and the utilization (right axis, 0 to 100%, dashed) from the history's `gpu_mhz` and `gpu_pct`; with `gpu_clock_max_mhz` 0 it draws utilization alone and says the clock is unavailable. Guard: `node tests/test_webui_dashboard.cjs` (headless Chromium through Playwright; skips if absent).
 - **Compact and Advanced**: a header toggle (remembered in `localStorage` `sushi-ui-mode`, Compact the default) switches
   the page's detail level through `body[data-mode]`. Compact shows what is loaded, decode and prefill tok/s, memory used and
   available, the SSD cache's use and the request count as big tiles, with a speed chart and a memory chart; Advanced is the
-  full dashboard (sessions, models table, every chart, latency, histograms, write counters). Elements only Advanced shows carry
-  the `adv` class, Compact-only ones `cmp`; the Models and Settings views hide their expert rows and columns the same way.
+  full dashboard (sessions, every chart, latency, histograms, write counters; models live on the Models tab). Elements only
+  Advanced shows carry the `adv` class, Compact-only ones `cmp`; the Models and Settings views hide their expert rows
+  and columns the same way, and a model's settings form lists every key it has in Advanced but the common five in
+  Compact. The Advanced switch builds no Advanced DOM while Compact is shown.
 - **The dashboard's charts come from the server's history**, not from the page's own polls: each poll asks
   `/metrics.json?since=<last sample time>`, appends the new samples with decode and prefill rates taken between neighbouring
   samples (`historyRates`), and plots at the server's `t_ms`. A tab in the background does not poll, and on return the next
   poll fills the whole interval in; two samples more than 7 s apart (the server was down, or the ring was cut) are drawn as a
-  gap, never joined. Without a `history` key (an older server) the page falls back to client-time points.
-- The **Compact view** shows a status strip (model, Idle/Busy, uptime from `history.started_ms`), five tiles and three charts.
-  Prefill and decode are separate charts with their own scales. A request's prefill speed is its computed prompt tokens over
-  the prefill time the server spent on it, taken from the `prefill_tokens_total` and `prefill_time_seconds` deltas between
-  two polls (one dot per finished request; the tile shows the latest, or the mean since start until one is seen). Decode is
-  the history's rate with idle samples drawn as gaps; the tile reads live while generating, else the last request's rate.
+  gap, never joined. A wider window than the one shown asks for everything again (`since=0`), also while paused. A change
+  made during a poll in flight is polled for as soon as that poll ends. `history.started_ms` is the process start: a
+  different value is a restart, which draws a marker at that server time, drops the old server's request dots and last-request
+  tiles and shows "Server restarted at ..." for a minute. Uptime reads from it. All times on the charts are the server's clock.
+- **Per-request log**: the same call returns `requests`, one entry per finished request after `since` (`request_id`, `t_ms`,
+  `prompt_tokens` computed, `cached_tokens` restored, `prefill_seconds`, `generated_tokens`, `decode_seconds`, `outcome`).
+  A request is sent again until a history sample passes it, so the page keeps the ones it has seen by `request_id@t_ms`.
+- The **Compact view** shows a status strip (model, Idle/Busy or Ready while metrics are off, uptime from the process start),
+  five tiles and three charts. Prefill and decode are separate charts with their own scales. A request's prefill speed is its
+  computed prompt tokens over its `prefill_seconds`, one dot per finished `ok` request at its own `t_ms`; the tile shows the
+  latest, or the mean since start until one is seen. A request that restored more than it computed is a hollow dot labelled
+  "N computed, M restored" (the time includes the restore, so it is no prefill speed) and never feeds the tile; a partly
+  restored one reads as a lower bound. Decode is the history's rate with idle samples drawn as gaps; the tile reads live while
+  generating, else the last request's `generated_tokens / decode_seconds` (any length). Offline, the tiles read "-" with
+  "server unreachable" and the charts dim. The SSD tile reads "-" while no model is loaded. The charts answer a tap (the
+  nearest point; a tap elsewhere hides it) and the arrow keys (the canvases take focus; Escape hides).
   The Advanced view's Decode and Prefill tiles and its prefill, decode and memory charts are the same functions (`speedTiles`,
   `eventChart`, the shared chart options), so both views read the same.
 - The dashboard's **Prefix cache writes** card (the last card) shows the `prefix_cache_writes` totals: bytes written since
@@ -391,12 +476,21 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   `reasoning_budget_tokens`.
 - Under `--api-key` the page is served without the key (it holds no data), asks for it on the first 401 and sends it as
   a Bearer token. Its fetches use `credentials: "omit"`: the 401's Basic challenge would otherwise open the browser's
-  own login dialog.
+  own login dialog. The key overlay is modal (`#appShell` is `inert` behind it, the key box has the focus); Forget the
+  API key is in the phone `⋯` menu and in Settings › About.
 - Conversations live in the browser's `localStorage` (every access guarded); attached images stay in memory only, as a
-  few photos would fill the storage quota.
+  few photos would fill the storage quota. Saved history is sanitised on load (a damaged chat or message is dropped or
+  coerced, never fatal). Tabs share one list: a save merges the stored list by id (this tab's deletions stay deleted)
+  and the `storage` event reloads it. A full store warns once and keeps the newest conversations. A new conversation is
+  saved and listed when its first message is sent. A reply that breaks off (cut socket, an SSE `error`, a close
+  without `finish_reason` or `[DONE]`) keeps the words already shown as an assistant message marked `interrupted` and
+  shows Retry; Stop before the first token shows Retry too. Retry or Regenerate on a turn whose images did not survive
+  a reload is refused with a toast, and such a message goes on the wire with a note in place of the images, never empty.
+- The chat shows a model by its `state`: `loading` and `evicting` get a badge and no button, `error` gets Retry load.
+  Error toasts leave after 8 s and a message already on screen is not shown twice.
 - `/props` gives the version and the update banner: shown while `update.available`, its button POSTs `/v1/update`,
   polls `/health` until the server has gone down and come back, reloads, and reports the new version or `update.error`.
-- Startup prints `chat in your browser: <url>` once (`chatPageUrl`: a `0.0.0.0` bind shows as `127.0.0.1`); `sushi run`
+- Startup prints `chat in your browser: <url>/chat` once (`chatPageUrl`: a `0.0.0.0` bind shows as `127.0.0.1`); `sushi run`
   prints it under its banner, since its log is quieted to warn.
 
 ## Self-update (`POST /v1/update`, `/props.update`)
@@ -411,6 +505,7 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   `--parent-pid` 403 (the host updates its engine), a request decoding or queued or a model loading 409 `update_busy`
   (refused, never queued), an install that cannot replace itself (Homebrew, source build, app bundle, unwritable) 409
   by name, no newer release known 409.
+- A running `sushibar` (the menu bar app) never blocks an update: it restarts itself when the `sushi` beside it changes version.
 - Accepted: 202 `{"status":"updating","from","to"}`, then the SIGTERM shutdown path and the in-place updater
   ([server-lifecycle](server-lifecycle.md#self-update)).
 
@@ -502,6 +597,10 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   disallowed. The result loads in an isolated image, never as live SVG in the chat DOM. The original code stays
   copyable. The upstream minified bundle is inline to keep the page self-contained; its license is in
   `src/webui/DOMPurify.LICENSE`. Updates should use a reviewed upstream release and rerun the renderer checks.
+- The page stays under 1 MB (`tests/test_webui.sh` checks it). Shared design tokens (`light-dark()` colours, one
+  spacing, type and radius scale) and components (`.btn`, `.badge`, `.card`, `.tile`, `.tbl`, `.set`, `.seg`, `confirm`
+  dialog) serve all four tabs; `node tests/test_webui_shell.cjs` guards the top bar, the 390 px phone fit of every tab, the
+  shared left edge and the font-size scale.
 - Checks: `node tests/test_webui_tools.cjs`, `node tests/test_webui_effort.cjs`, `node tests/test_webui_prefix_cache.cjs`, `node tests/test_webui_dashboard.cjs`, `tests/test_webui.sh`, and the
   `web tools:` unit test. Generate the
   browser renderer suite with `node tests/test_webui_render.cjs /tmp/sushi-render-tests/index.html`, serve that

@@ -8,16 +8,71 @@ const model_registry_mod = @import("model_registry.zig");
 const disk_placement = @import("disk_placement.zig");
 const http_conn = @import("http_conn.zig");
 const server = @import("server.zig");
+const model_discovery = @import("model_discovery.zig");
+const expert_quant = @import("expert_quant.zig");
+const model_mod = @import("model.zig");
+const model_load = @import("model_load.zig");
+const models_api = @import("models_api.zig");
+const expert_stream = @import("expert_stream.zig");
+const chat = @import("chat.zig");
 
 const Edit = model_settings.Edit;
 
-pub const ModelRow = struct { id: []const u8, path: []const u8, state: []const u8, bytes: ?u64 };
+/// A running SSD tier as the inference thread last published it.
+pub const TierView = struct { cap_bytes: u64, used_bytes: u64 };
+
+pub const ModelRow = struct {
+    id: []const u8,
+    path: []const u8,
+    state: []const u8,
+    bytes: ?u64,
+    /// What the key gates and value limits read (`model_settings.limit`).
+    fit: model_settings.Fit = .{ .arch = "", .streams_experts = false, .has_vision = false },
+    /// A stub's discovery found every shard its expert index names.
+    index_complete: bool = false,
+    /// The file values a ready model's load stamped; null for a model that is not loaded.
+    loaded: ?model_settings.Override = null,
+    tier: ?TierView = null,
+};
 
 pub const ServerView = struct {
     default_models_dir: []const u8,
     boot_roots: []const []const u8,
-    cache_budget_bytes: u64,
+    /// The server-wide ask, which loads without a number of their own start from.
+    ask_bytes: u64,
 };
+
+/// The file value of one key as a JSON value, or null when the file had none.
+fn overrideValue(o: model_settings.Override, name: []const u8) ?std.json.Value {
+    const eql = std.mem.eql;
+    if (eql(u8, name, "ctx_size")) return if (o.ctx_size) |v| .{ .integer = v } else null;
+    if (eql(u8, name, "kv_quant")) return if (o.kv_quant) |v| .{ .string = v.wireName() } else null;
+    if (eql(u8, name, "mtp")) return if (o.mtp) |v| .{ .bool = v } else null;
+    if (eql(u8, name, "mtp_acceptance")) return if (o.mtp_acceptance) |v| .{ .string = @import("mtp_acceptance.zig").name(v) } else null;
+    if (eql(u8, name, "mtp_greedy_tail")) return if (o.mtp_greedy_tail) |v| .{ .bool = v } else null;
+    if (eql(u8, name, "ssd_budget_gb")) return if (o.ssd_budget_gb) |v| .{ .integer = v } else null;
+    if (eql(u8, name, "ssd_prefetch")) return if (o.ssd_prefetch) |v| .{ .integer = v } else null;
+    if (eql(u8, name, "preserve_thinking")) return if (o.preserve_thinking) |v| .{ .bool = v } else null;
+    if (eql(u8, name, "think_penalty")) return if (o.think_penalty) |v| .{ .float = v } else null;
+    if (eql(u8, name, "vision")) return if (o.vision) |v| .{ .bool = v } else null;
+    return null;
+}
+
+/// The settings a ready model's load stamped on its config.
+fn loadedWith(config: *const model_mod.ModelConfig) model_settings.Override {
+    return .{
+        .ctx_size = if (config.ctx_override > 0) config.ctx_override else null,
+        .kv_quant = config.kv_quant_override,
+        .mtp = config.mtp_override,
+        .mtp_acceptance = config.mtp_acceptance_override,
+        .mtp_greedy_tail = config.mtp_greedy_tail_override,
+        .ssd_budget_gb = if (config.ssd_budget_gb_override > 0) config.ssd_budget_gb_override else null,
+        .ssd_prefetch = config.ssd_prefetch_override,
+        .preserve_thinking = config.preserve_thinking_override,
+        .think_penalty = config.think_penalty_override,
+        .vision = config.vision_override,
+    };
+}
 
 fn writeJson(w: *std.Io.Writer, v: anytype) !void {
     try std.json.Stringify.value(v, .{}, w);
@@ -40,11 +95,51 @@ fn writeSpec(w: *std.Io.Writer, spec: model_settings.KeySpec) !void {
 fn writeKey(w: *std.Io.Writer, spec: model_settings.KeySpec, file_value: ?std.json.Value, lock: ?*const model_settings.Lock) !void {
     const valid = if (file_value) |v| (if (model_settings.validate(spec, v)) true else |_| false) else false;
     try w.writeAll("{\"file\":");
-    if (valid) try writeJson(w, file_value.?) else try w.writeAll("null");
+    if (valid) try writeJson(w, model_settings.canonicalValue(spec, file_value.?)) else try w.writeAll("null");
     const pinned = if (lock) |l| l.set else false;
     try w.writeAll(",\"flag\":");
     if (pinned) try writeJson(w, lock.?.text()) else try w.writeAll("null");
     try w.print(",\"source\":\"{s}\",\"locked\":{}}}", .{ if (pinned) "flag" else if (valid) "file" else "default", pinned });
+}
+
+/// What a model's keys may be set to, for every key with a constraint: `disabled` (the key does nothing), `choices` (the
+/// subset it stores), `max`, `requires` (another key's value it needs) and `unset` (keys that must stay unset), each with a `why`.
+fn writeLimits(w: *std.Io.Writer, fit: model_settings.Fit) !void {
+    try w.writeAll("{");
+    var first = true;
+    for (model_settings.model_keys) |k| {
+        const l = model_settings.limit(k.name, fit);
+        var kept: [8][]const u8 = undefined;
+        var n_kept: usize = 0;
+        for (k.choices) |c| if (model_settings.choiceAllowed(k.name, c, fit) and n_kept < kept.len) {
+            kept[n_kept] = c;
+            n_kept += 1;
+        };
+        const narrowed = k.choices.len > 0 and n_kept < k.choices.len;
+        if (l.isEmpty() and !narrowed) continue;
+        if (!first) try w.writeAll(",");
+        first = false;
+        try w.print("\"{s}\":{{", .{k.name});
+        if (l.disabled) try w.writeAll("\"disabled\":true,");
+        if (narrowed) {
+            try w.writeAll("\"choices\":");
+            try writeJson(w, kept[0..n_kept]);
+            try w.writeAll(",");
+        }
+        if (l.max > 0) try w.print("\"max\":{d},", .{l.max});
+        if (l.requires_mtp) try w.writeAll("\"requires\":{\"mtp\":true},");
+        if (l.unset.len > 0) {
+            try w.writeAll("\"unset\":");
+            try writeJson(w, l.unset);
+            try w.writeAll(",");
+        }
+        var buf: [96]u8 = undefined;
+        const why = if (l.why.len > 0) l.why else if (l.max > 0) model_settings.maxWhy(&buf, l.max) else "This model's cache stores only these widths.";
+        try w.writeAll("\"why\":");
+        try writeJson(w, why);
+        try w.writeAll("}");
+    }
+    try w.writeAll("}");
 }
 
 pub fn render(
@@ -87,9 +182,24 @@ pub fn render(
     try writeJson(w, srv.prefix_cache_disk_gb);
     try w.writeAll(",\"flag\":");
     if (cache_pinned) try writeJson(w, locks.prefix_cache_disk_gb.text()) else try w.writeAll("null");
-    try w.print(",\"source\":\"{s}\",\"locked\":{},\"effective_bytes\":{d},\"applies\":\"a running tier takes a new size at once and evicts down to it; 0 (off) and removing the key apply at the next load\"}}}}", .{
-        if (cache_pinned) "flag" else if (srv.prefix_cache_disk_gb != null) "file" else "default", cache_pinned, view.cache_budget_bytes,
+    var effective = view.ask_bytes;
+    var running = false;
+    for (rows) |row| if (row.tier) |t| {
+        effective = if (running) @max(effective, t.cap_bytes) else t.cap_bytes;
+        running = true;
+    };
+    try w.print(",\"source\":\"{s}\",\"locked\":{},\"effective_bytes\":{d},\"ask_bytes\":{d},\"default_bytes\":{d},\"running_tiers\":[", .{
+        if (cache_pinned) "flag" else if (srv.prefix_cache_disk_gb != null) "file" else "default", cache_pinned, effective, view.ask_bytes, disk_placement.DEFAULT_DISK_CAP,
     });
+    var first_tier = true;
+    for (rows) |row| if (row.tier) |t| {
+        if (!first_tier) try w.writeAll(",");
+        first_tier = false;
+        try w.writeAll("{\"model\":");
+        try writeJson(w, row.id);
+        try w.print(",\"cap_bytes\":{d},\"used_bytes\":{d}}}", .{ t.cap_bytes, t.used_bytes });
+    };
+    try w.writeAll("],\"applies\":\"a running tier takes a new size at once and evicts down to it; 0 (off) and removing the key apply at the next load\"}}");
 
     try w.writeAll(",\"models\":[");
     for (rows, 0..) |row, i| {
@@ -100,6 +210,25 @@ pub fn render(
         try writeJson(w, row.path);
         try w.print(",\"state\":\"{s}\",\"bytes_on_disk\":", .{row.state});
         try writeJson(w, row.bytes);
+        try w.writeAll(",\"keys\":[");
+        var first_key = true;
+        for (model_settings.model_keys) |k| if (model_settings.applies(k.name, row.fit)) {
+            if (!first_key) try w.writeAll(",");
+            first_key = false;
+            try writeJson(w, k.name);
+        };
+        try w.writeAll("],\"limits\":");
+        try writeLimits(w, row.fit);
+        try w.writeAll(",\"loaded_with\":");
+        if (row.loaded) |o| {
+            try w.writeAll("{");
+            for (model_settings.model_keys, 0..) |k, ki| {
+                if (ki > 0) try w.writeAll(",");
+                try w.print("\"{s}\":", .{k.name});
+                try writeJson(w, overrideValue(o, k.name));
+            }
+            try w.writeAll("}");
+        } else try w.writeAll("null");
         try w.writeAll(",\"settings\":{");
         const obj = model_settings.modelObject(file, row.path);
         for (model_settings.model_keys, 0..) |k, ki| {
@@ -139,7 +268,7 @@ fn collect(arena: std.mem.Allocator, specs: []const model_settings.KeySpec, obj:
         }
         model_settings.validate(spec, kv.value_ptr.*) catch
             return reject(arena, 400, "invalid_setting", "\"{s}\" does not take that value", .{spec.name});
-        edits.append(arena, .{ .key = spec.name, .value = kv.value_ptr.* }) catch return reject(arena, 500, "internal_error", "out of memory", .{});
+        edits.append(arena, .{ .key = spec.name, .value = model_settings.canonicalValue(spec, kv.value_ptr.*) }) catch return reject(arena, 500, "internal_error", "out of memory", .{});
     }
     return null;
 }
@@ -186,16 +315,67 @@ fn stateName(s: model_registry_mod.LoadState) []const u8 {
     return @tagName(s);
 }
 
+/// What an unloaded model's config.json says, read without the registry lock.
+fn stubFit(io: std.Io, allocator: std.mem.Allocator, row: *const ModelRow) model_settings.Fit {
+    const arch = row.fit.arch;
+    const sm = model_discovery.readStubMeta(io, allocator, row.path);
+    const geometry = sm.found and sm.hidden_size > 0 and sm.num_hidden_layers > 0 and sm.num_experts > 0 and
+        sm.num_experts_per_tok > 0 and sm.moe_intermediate_size > 0;
+    const probe = model_mod.ModelConfig{ .model_type = arch };
+    const latent = probe.isGlm5();
+    const layout: expert_quant.Layout = if (sm.quantized_experts) .exl3_k4 else .mxfp4_w123;
+    return .{
+        .arch = arch,
+        .streams_experts = geometry and expert_quant.isExpertStreamingArch(arch),
+        .has_vision = sm.has_vision,
+        .serves_mtp = !latent,
+        .streaming_required = probe.isDsv41() or models_api.streamingRequiredMarker(arch, sm.quant_bits, sm.quantized_experts, geometry, row.index_complete),
+        .head_streams = expert_stream.streamedMtpHeadSupported(probe.isQwen4(), probe.isDsv41(), layout),
+        .stq_experts = sm.quantized_experts,
+        .latent_kv = latent,
+        .context_cap = sm.context_cap,
+    };
+}
+
+/// The facts only the pack's files hold, read for a loaded model as for a stub: its head, and for a stub its chat template.
+fn readPackFacts(io: std.Io, allocator: std.mem.Allocator, row: *ModelRow) void {
+    if (row.loaded == null) row.fit = stubFit(io, allocator, row);
+    row.fit.mtp_head = model_load.packShipsMtpHead(io, allocator, row.fit.arch, row.path);
+    if (row.loaded != null) return;
+    var chat_config = chat.loadChatConfig(io, allocator, row.path) catch return;
+    defer chat_config.deinit();
+    row.fit.template_preserves_thinking = chat.templateTakesPreserveThinking(chat_config.chat_template);
+    row.fit.template_thinks = chat.templateHasThinkSpan(chat_config.chat_template);
+}
+
+/// An entry's row from what the registry holds; the caller holds its lock.
+fn heldRow(e: *model_registry_mod.LoadedModel) ModelRow {
+    var row: ModelRow = .{ .id = e.id, .path = e.path, .state = stateName(e.state), .bytes = e.bytes_on_disk, .index_complete = e.streaming_index_complete };
+    row.fit.arch = e.arch_hint;
+    if (e.state == .ready and e.config != null) {
+        const c = e.config.?;
+        row.fit = server.settingsFit(c);
+        row.loaded = loadedWith(c);
+        if (e.chat_config) |cc| {
+            row.fit.template_preserves_thinking = chat.templateTakesPreserveThinking(cc.chat_template);
+            row.fit.template_thinks = chat.templateHasThinkSpan(cc.chat_template);
+        }
+        const snap = e.disk_stats.snapshot();
+        if (snap.namespace != 0) row.tier = .{ .cap_bytes = snap.budget, .used_bytes = snap.used };
+    }
+    return row;
+}
+
 fn collectRows(allocator: std.mem.Allocator, registry: *model_registry_mod.ModelRegistry) ![]ModelRow {
     var rows = std.ArrayList(ModelRow).empty;
     errdefer rows.deinit(allocator);
-    registry.mutex.lockUncancelable(registry.io);
-    defer registry.mutex.unlock(registry.io);
-    var it = registry.entries.valueIterator();
-    while (it.next()) |p| {
-        const e = p.*;
-        try rows.append(allocator, .{ .id = e.id, .path = e.path, .state = stateName(e.state), .bytes = e.bytes_on_disk });
+    {
+        registry.mutex.lockUncancelable(registry.io);
+        defer registry.mutex.unlock(registry.io);
+        var it = registry.entries.valueIterator();
+        while (it.next()) |p| try rows.append(allocator, heldRow(p.*));
     }
+    for (rows.items) |*row| readPackFacts(registry.io, allocator, row);
     std.mem.sort(ModelRow, rows.items, {}, struct {
         fn lt(_: void, a: ModelRow, b: ModelRow) bool {
             return std.mem.lessThan(u8, a.id, b.id);
@@ -222,7 +402,7 @@ pub fn handleGet(allocator: std.mem.Allocator, stream: *http_conn.Conn) !void {
     const body = try render(allocator, path, &file, rows, &model_settings.launch_locks, .{
         .default_models_dir = default_dir,
         .boot_roots = roots,
-        .cache_budget_bytes = server.prefix_cache_disk_bytes,
+        .ask_bytes = server.diskAsk().bytes,
     });
     defer allocator.free(body);
     try server.sendResponse(stream, "200 OK", "application/json", body);
@@ -232,6 +412,13 @@ fn dirReadable(io: std.Io, path: []const u8) bool {
     var d = std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch return false;
     d.close(io);
     return true;
+}
+
+/// The 400 text for the first edit this model cannot honour, or null.
+fn refusalMessage(arena: std.mem.Allocator, fit: model_settings.Fit, existing: ?std.json.ObjectMap, edits: []const Edit) ?[]const u8 {
+    var why_buf: [128]u8 = undefined;
+    const r = model_settings.refuseEdits(fit, existing, edits, &why_buf) orelse return null;
+    return std.fmt.allocPrint(arena, "\"{s}\" cannot be set for this model: {s}", .{ r.key, r.why }) catch "a setting this model cannot honour";
 }
 
 pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request_body: []const u8) !void {
@@ -258,6 +445,8 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
             return;
         }
     };
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = model_settings.defaultPath(&path_buf);
     var model_path: []const u8 = "";
     var model_loaded = false;
     if (plan.model_id) |id| {
@@ -268,11 +457,20 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
         model_path = entry.path;
         sch.registry.mutex.lockUncancelable(sch.io);
         model_loaded = entry.state == .ready;
+        var row = heldRow(entry);
         sch.registry.mutex.unlock(sch.io);
+        if (plan.model_edits.len > 0) {
+            readPackFacts(stream.io, allocator, &row);
+            var held = model_settings.load(allocator, stream.io, path);
+            defer held.deinit();
+            if (refusalMessage(arena, row.fit, model_settings.modelObject(&held, model_path), plan.model_edits)) |message| {
+                try server.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_setting", message, 400);
+                return;
+            }
+        }
     }
 
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = model_settings.defaultPath(&path_buf);
+    var message_buf: [160]u8 = undefined;
     const write = struct {
         fn run(a: std.mem.Allocator, io: std.Io, p: []const u8, section: []const u8, edits: []const Edit) !void {
             if (edits.len > 0) try model_settings.writeEdits(a, io, p, section, edits);
@@ -293,7 +491,7 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
         if (std.mem.eql(u8, e.key, "prefix_cache_disk_gb")) {
             try writeJson(w, applyCacheBudget(sch, e.value));
         } else {
-            try writeJson(w, applyModelsDir(sch, e.value));
+            try writeJson(w, applyModelsDir(sch, &message_buf));
         }
     }
     if (plan.model_edits.len > 0) {
@@ -314,31 +512,43 @@ fn writeFailed(allocator: std.mem.Allocator, stream: *http_conn.Conn, err: anyer
     try server.sendErrorResponse(allocator, stream, "500 Internal Server Error", "settings_write_failed", "Could not write the settings file", 500);
 }
 
-/// The new SSD tier size reaches the running tiers at once; the launch flag, when given, keeps the number it set.
+fn cacheBudgetMessage(running_tiers_resized: usize) []const u8 {
+    return if (running_tiers_resized > 0) "applied to the running tiers" else "saved; applies at the next model load";
+}
+
+/// The new SSD tier size reaches the running tiers at once and every later load; the launch flag, when given, keeps the number it set.
 fn applyCacheBudget(sch: *@import("scheduler.zig").Scheduler, value: ?std.json.Value) []const u8 {
     if (model_settings.launch_locks.prefix_cache_disk_gb.set) return "saved; the --prefix-cache-disk flag still sets the size until a start without it";
     const gb: ?u64 = if (value) |v| @intCast(v.integer) else null;
-    server.prefix_cache_disk_bytes = if (gb) |g| g << 30 else disk_placement.DEFAULT_DISK_CAP;
-    server.prefix_cache_disk_explicit = gb != null;
+    server.setDiskAsk(if (gb) |g| g << 30 else disk_placement.DEFAULT_DISK_CAP, gb != null);
     const bytes = (gb orelse 0) << 30;
-    if (gb == null or bytes == 0) return "saved; applies at the next model load";
-    var it = sch.registry.entries.valueIterator();
+    if (gb == null or bytes == 0) return cacheBudgetMessage(0);
     var tiers = std.ArrayList(*model_registry_mod.LoadedModel).empty;
     defer tiers.deinit(sch.allocator);
-    sch.registry.mutex.lockUncancelable(sch.io);
-    while (it.next()) |p| {
-        if (p.*.state == .ready and p.*.disk_stats.snapshot().namespace != 0) tiers.append(sch.allocator, p.*) catch {};
+    {
+        sch.registry.mutex.lockUncancelable(sch.io);
+        defer sch.registry.mutex.unlock(sch.io);
+        var it = sch.registry.entries.valueIterator();
+        while (it.next()) |p| {
+            if (p.*.state == .ready and p.*.disk_stats.snapshot().namespace != 0) tiers.append(sch.allocator, p.*) catch {};
+        }
     }
-    sch.registry.mutex.unlock(sch.io);
-    for (tiers.items) |e| _ = sch.prefixAdmin(.{ .entry = e, .action = .set_cap, .cap_bytes = bytes }) catch return "saved; applies at the next model load";
-    return "applied to the running tiers";
+    var resized: usize = 0;
+    for (tiers.items) |e| {
+        const r = sch.prefixAdmin(.{ .entry = e, .action = .set_cap, .cap_bytes = bytes }) catch break;
+        if (r.outcome == .cleared) resized += 1;
+    }
+    return cacheBudgetMessage(resized);
 }
 
-fn applyModelsDir(sch: *@import("scheduler.zig").Scheduler, value: ?std.json.Value) []const u8 {
-    _ = value;
+fn modelsDirMessage(buf: []u8, rescan: anyerror!u32) []const u8 {
+    const added = rescan catch return "saved; the rescan failed, use /v1/models/rescan";
+    return std.fmt.bufPrint(buf, "saved; models rescanned, {d} added", .{added}) catch "saved; models rescanned";
+}
+
+fn applyModelsDir(sch: *@import("scheduler.zig").Scheduler, buf: []u8) []const u8 {
     if (model_settings.launch_locks.models_dir.set) return "saved; the --model-dir flag still sets the directories until a start without it";
-    _ = sch.registry.rescan() catch return "saved; the rescan failed, use /v1/models/rescan";
-    return "saved; models rescanned";
+    return modelsDirMessage(buf, sch.registry.rescan());
 }
 
 // ── Tests ──
@@ -379,6 +589,122 @@ test "settings api: a request names real keys with valid values, or is refused w
     try expectRejected("nope", 400, "invalid_request_error");
 }
 
+test "settings api: a kv_quant request in any spelling is stored as its choice name; a value the loader would not read is refused" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    for ([_][]const u8{ "0", "16", "\"16\"", "\"off\"" }) |spelling| {
+        const body = try std.fmt.allocPrint(arena_state.allocator(), "{{\"model\":\"m\",\"set\":{{\"kv_quant\":{s}}}}}", .{spelling});
+        const parsed = parseRequest(arena_state.allocator(), body);
+        try testing.expectEqualStrings("off", parsed.ok.model_edits[0].value.?.string);
+    }
+    const eight = parseRequest(arena_state.allocator(), "{\"model\":\"m\",\"set\":{\"kv_quant\":8}}");
+    try testing.expectEqualStrings("8", eight.ok.model_edits[0].value.?.string);
+    try expectRejected("{\"model\":\"m\",\"set\":{\"kv_quant\":5}}", 400, "invalid_setting");
+}
+
+test "settings api: the SSD message says running tiers only when one was resized; models_dir reports what the rescan added" {
+    try testing.expectEqualStrings("applied to the running tiers", cacheBudgetMessage(1));
+    try testing.expectEqualStrings("saved; applies at the next model load", cacheBudgetMessage(0));
+    var buf: [160]u8 = undefined;
+    try testing.expectEqualStrings("saved; models rescanned, 2 added", modelsDirMessage(&buf, 2));
+    try testing.expectEqualStrings("saved; the rescan failed, use /v1/models/rescan", modelsDirMessage(&buf, error.OutOfMemory));
+}
+
+test "settings api: render names the keys a model honours, what a loaded model loaded with, and the tiers in force" {
+    var file = try model_settings.parse(testing.allocator,
+        \\{"/m/a": {"kv_quant": 0}, "/m/b": {"kv_quant": "8"}}
+    );
+    defer file.deinit();
+    const locks: model_settings.LaunchLocks = .{};
+    const rows = [_]ModelRow{
+        .{ .id = "a", .path = "/m/a", .state = "ready", .bytes = 5, .fit = .{ .arch = model_settings.prefetch_arch, .streams_experts = true, .has_vision = true }, .loaded = .{ .ctx_size = 4096, .kv_quant = null, .ssd_budget_gb = 60, .mtp_acceptance = .exact }, .tier = .{ .cap_bytes = 2 << 30, .used_bytes = 7 } },
+        .{ .id = "b", .path = "/m/b", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "qwen4_exp", .streams_experts = false, .has_vision = false } },
+    };
+    const body = try render(testing.allocator, "/h/s.json", &file, &rows, &locks, .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 });
+    defer testing.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+
+    const cache = root.get("server").?.object.get("prefix_cache_disk_gb").?.object;
+    try testing.expectEqual(@as(i64, 2 << 30), cache.get("effective_bytes").?.integer);
+    try testing.expectEqual(@as(i64, 20 << 30), cache.get("ask_bytes").?.integer);
+    const tier = cache.get("running_tiers").?.array.items[0].object;
+    try testing.expectEqualStrings("a", tier.get("model").?.string);
+    try testing.expectEqual(@as(i64, 7), tier.get("used_bytes").?.integer);
+
+    const a = root.get("models").?.array.items[0].object;
+    var has_prefetch = false;
+    for (a.get("keys").?.array.items) |k| {
+        try testing.expect(!std.mem.eql(u8, k.string, "kv_quant"));
+        if (std.mem.eql(u8, k.string, "ssd_prefetch")) has_prefetch = true;
+    }
+    try testing.expect(has_prefetch);
+    const lw = a.get("loaded_with").?.object;
+    try testing.expectEqual(@as(i64, 4096), lw.get("ctx_size").?.integer);
+    try testing.expect(lw.get("kv_quant").? == .null);
+    try testing.expectEqualStrings("exact", lw.get("mtp_acceptance").?.string);
+    try testing.expectEqualStrings("off", a.get("settings").?.object.get("kv_quant").?.object.get("file").?.string);
+
+    const b = root.get("models").?.array.items[1].object;
+    try testing.expect(b.get("loaded_with").? == .null);
+    for (b.get("keys").?.array.items) |k| try testing.expect(!std.mem.startsWith(u8, k.string, "ssd_"));
+}
+
+test "settings api: each model lists the limits its arch and pack put on its keys, and nothing for a key it does not constrain" {
+    var file = try model_settings.parse(testing.allocator, "{}");
+    defer file.deinit();
+    const locks: model_settings.LaunchLocks = .{};
+    const rows = [_]ModelRow{
+        .{ .id = "latent", .path = "/m/a", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .latent_kv = true, .serves_mtp = false, .context_cap = 131072 } },
+        .{ .id = "dropped", .path = "/m/b", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "b", .streams_experts = true, .has_vision = false, .head_streams = false } },
+        .{ .id = "plain", .path = "/m/c", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "c", .streams_experts = true, .has_vision = true } },
+        .{ .id = "bare", .path = "/m/d", .state = "unloaded", .bytes = 5, .fit = .{ .arch = model_settings.prefetch_arch, .streams_experts = true, .has_vision = true, .template_preserves_thinking = false } },
+    };
+    const body = try render(testing.allocator, "/h/s.json", &file, &rows, &locks, .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 });
+    defer testing.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const models = parsed.value.object.get("models").?.array.items;
+
+    const latent = models[0].object.get("limits").?.object;
+    const kv = latent.get("kv_quant").?.object;
+    try testing.expectEqual(@as(usize, 3), kv.get("choices").?.array.items.len);
+    try testing.expectEqualStrings("6", kv.get("choices").?.array.items[1].string);
+    try testing.expect(latent.get("mtp").?.object.get("disabled").?.bool);
+    try testing.expect(latent.get("mtp_acceptance").?.object.get("disabled").?.bool);
+    try testing.expect(latent.get("mtp").?.object.get("why").?.string.len > 0);
+    try testing.expectEqual(@as(i64, 131072), latent.get("ctx_size").?.object.get("max").?.integer);
+
+    const dropped = models[1].object.get("limits").?.object;
+    try testing.expectEqualStrings("ssd_budget_gb", dropped.get("mtp").?.object.get("unset").?.array.items[0].string);
+    try testing.expect(dropped.get("mtp_greedy_tail").?.object.get("requires").?.object.get("mtp").?.bool);
+    try testing.expect(dropped.get("kv_quant") == null);
+
+    const plain = models[2].object.get("limits").?.object;
+    for ([_][]const u8{ "kv_quant", "mtp", "ctx_size", "ssd_budget_gb", "vision", "preserve_thinking", "think_penalty" }) |k| try testing.expect(plain.get(k) == null);
+    try testing.expect(plain.get("ssd_prefetch").?.object.get("disabled").?.bool);
+    try testing.expect(plain.get("mtp_acceptance").?.object.get("unset") == null);
+
+    const bare = models[3].object.get("limits").?.object;
+    try testing.expect(bare.get("kv_quant").?.object.get("disabled").?.bool);
+    try testing.expect(bare.get("preserve_thinking").?.object.get("disabled").?.bool);
+    try testing.expect(bare.get("ssd_prefetch") == null);
+}
+
+test "settings api: a save the model cannot honour is refused with its reason, a removal never" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const latent: model_settings.Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .latent_kv = true, .serves_mtp = false };
+    const four = refusalMessage(arena, latent, null, &.{.{ .key = "kv_quant", .value = .{ .string = "4" } }}).?;
+    try testing.expect(std.mem.indexOf(u8, four, "\"kv_quant\"") != null);
+    try testing.expect(refusalMessage(arena, latent, null, &.{.{ .key = "kv_quant", .value = .{ .string = "off" } }}) == null);
+    const mtp = refusalMessage(arena, latent, null, &.{.{ .key = "mtp", .value = .{ .bool = false } }}).?;
+    try testing.expect(std.mem.indexOf(u8, mtp, "speculative head") != null);
+    try testing.expect(refusalMessage(arena, latent, null, &.{.{ .key = "mtp", .value = null }}) == null);
+}
+
 test "settings api: render reports the file's value, the pinning flag and the winner per key" {
     var file = try model_settings.parse(testing.allocator,
         \\{"/m/a": {"kv_quant": "4", "ssd_prefetch": 200, "mtp": false}, "server": {"prefix_cache_disk_gb": 30}}
@@ -387,7 +713,7 @@ test "settings api: render reports the file's value, the pinning flag and the wi
     var locks: model_settings.LaunchLocks = .{};
     locks.modelMut("mtp").pin("on", .{});
     const rows = [_]ModelRow{.{ .id = "a", .path = "/m/a", .state = "ready", .bytes = 5 }};
-    const body = try render(testing.allocator, "/h/model-settings.json", &file, &rows, &locks, .{ .default_models_dir = "/h/.sushi/models", .boot_roots = &.{"/h/.sushi/models"}, .cache_budget_bytes = 30 << 30 });
+    const body = try render(testing.allocator, "/h/model-settings.json", &file, &rows, &locks, .{ .default_models_dir = "/h/.sushi/models", .boot_roots = &.{"/h/.sushi/models"}, .ask_bytes = 30 << 30 });
     defer testing.allocator.free(body);
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
     defer parsed.deinit();
@@ -396,6 +722,8 @@ test "settings api: render reports the file's value, the pinning flag and the wi
     try testing.expectEqual(@as(i64, 30), cache.get("file").?.integer);
     try testing.expectEqualStrings("file", cache.get("source").?.string);
     try testing.expect(!cache.get("locked").?.bool);
+    // A saved size leaves the size "Use default" goes back to.
+    try testing.expectEqual(@as(i64, @intCast(disk_placement.DEFAULT_DISK_CAP)), cache.get("default_bytes").?.integer);
     const s = root.get("models").?.array.items[0].object.get("settings").?.object;
     try testing.expectEqualStrings("file", s.get("kv_quant").?.object.get("source").?.string);
     try testing.expectEqualStrings("4", s.get("kv_quant").?.object.get("file").?.string);

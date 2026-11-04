@@ -357,6 +357,8 @@ pub const DiscoveredModel = struct {
     /// Approximate weight size on disk in bytes (sum of *.safetensors). Used
     /// later by eviction; null if scan failed.
     bytes_on_disk: ?u64,
+    /// Part of `bytes_on_disk` that comes through symlinked shards whose target is outside the pack folder.
+    bytes_linked: u64 = 0,
     /// `model_type` peeked from config.json (e.g. "qwen4_exp"), so registry stubs
     /// can advertise arch-derived capabilities before a cold load. Empty
     /// when unknown.
@@ -473,6 +475,18 @@ pub fn discoverModelsMany(io: std.Io, allocator: std.mem.Allocator, roots: []con
     return .{ .models = try merged.toOwnedSlice(allocator), .allocator = allocator, .roots = roots_owned };
 }
 
+/// Folder name that holds the repo's tiny test models (`${SUSHI_MODELS_DIR}/test-fixtures/<name>`).
+const fixtures_dir_name = "test-fixtures";
+
+/// A folder met BELOW a root that discovery never lists: dot folders and the test fixtures.
+/// A root the user names is not asked, so `--model-dir .../test-fixtures` still lists them.
+fn skipsBelowRoot(name: []const u8, root: []const u8) bool {
+    if (name.len == 0 or name[0] == '.') return true;
+    if (!std.mem.eql(u8, name, fixtures_dir_name)) return false;
+    log.debug("[discovery] skip {s} under {s}: test fixtures are not models to serve\n", .{ name, root });
+    return true;
+}
+
 /// Core scan over an already-open root. Two layouts are recognized:
 ///   <root>/<model>/config.json               → id "<model>"
 ///   <root>/<org>/<model>/config.json         → id "<org>/<model>"
@@ -492,7 +506,7 @@ pub fn discoverModelsInDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
         if (entry.kind != .directory and entry.kind != .sym_link) continue;
-        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        if (skipsBelowRoot(entry.name, model_dir)) continue;
 
         const is_model_dir = try tryAddModel(io, allocator, dir, entry.name, "", model_dir, &found);
         if (is_model_dir) continue;
@@ -503,7 +517,7 @@ pub fn discoverModelsInDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io
         var org_iter = org.iterate();
         while (org_iter.next(io) catch null) |org_entry| {
             if (org_entry.kind != .directory and org_entry.kind != .sym_link) continue;
-            if (org_entry.name.len == 0 or org_entry.name[0] == '.') continue;
+            if (skipsBelowRoot(org_entry.name, model_dir)) continue;
             _ = try tryAddModel(io, allocator, org, org_entry.name, entry.name, model_dir, &found);
         }
     }
@@ -534,6 +548,7 @@ fn tryAddModel(
     defer sub.close(io);
 
     var bytes: u64 = 0;
+    var linked: u64 = 0;
     var bytes_ok = false;
 
     const model_type: []const u8 = blk: {
@@ -584,6 +599,7 @@ fn tryAddModel(
                 const st = sd.statFile(io, sub_entry.name, .{}) catch continue;
                 if (st.kind != .file) continue;
                 bytes += @intCast(st.size);
+                linked += linkedOutside(io, sd.*, sub_entry, @intCast(st.size));
                 bytes_ok = true;
             }
         }
@@ -604,6 +620,7 @@ fn tryAddModel(
         .id = id,
         .path = path,
         .bytes_on_disk = if (bytes_ok) bytes else null,
+        .bytes_linked = linked,
         .model_type = model_type,
         .streaming_index_complete = streaming_index_complete,
     });
@@ -621,7 +638,21 @@ pub const ProbeResult = struct {
     model_type: []const u8,
     /// Sum of *.safetensors bytes; null if the scan failed.
     bytes_on_disk: ?u64,
+    bytes_linked: u64 = 0,
 };
+
+/// A symlinked file's size when its target lies outside `dir`, else 0.
+fn linkedOutside(io: std.Io, dir: std.Io.Dir, entry: std.Io.Dir.Entry, size: u64) u64 {
+    if (entry.kind != .sym_link) return 0;
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var target_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = dir.realPath(io, &root_buf) catch return 0;
+    const target_len = dir.realPathFile(io, entry.name, &target_buf) catch return 0;
+    const root = root_buf[0..root_len];
+    const target = target_buf[0..target_len];
+    const inside = target.len > root.len and std.mem.startsWith(u8, target, root) and target[root.len] == '/';
+    return if (inside) 0 else size;
+}
 
 /// Validate an arbitrary absolute model directory the way discovery would
 /// (config.json present, supported model_type and quant mode) and report its
@@ -653,6 +684,7 @@ pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const
     errdefer allocator.free(model_type);
 
     var bytes: u64 = 0;
+    var linked: u64 = 0;
     var bytes_ok = false;
     var sub = dir.openDir(io, base, .{ .iterate = true }) catch null;
     if (sub) |*sd| {
@@ -664,10 +696,11 @@ pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const
             const st = sd.statFile(io, entry.name, .{}) catch continue;
             if (st.kind != .file) continue;
             bytes += @intCast(st.size);
+            linked += linkedOutside(io, sd.*, entry, @intCast(st.size));
             bytes_ok = true;
         }
     }
-    return .{ .model_type = model_type, .bytes_on_disk = if (bytes_ok) bytes else null };
+    return .{ .model_type = model_type, .bytes_on_disk = if (bytes_ok) bytes else null, .bytes_linked = linked };
 }
 
 /// Metadata an `unloaded` stub can advertise via `/v1/models` without faulting
@@ -680,6 +713,8 @@ pub const StubMeta = struct {
     hidden_size: u32 = 0,
     num_hidden_layers: u32 = 0,
     max_position_embeddings: u32 = 0,
+    /// The window `ModelConfig.contextCap` derives once loaded (YaRN-scaled where the checkpoint is); 0 = unread.
+    context_cap: u32 = 0,
     quant_bits: u32 = 0,
     expert_quant_rate: ?expert_quant.expert_exl3.Rate = null,
     /// The pack carries an `expert_quant` block: its routed experts are already
@@ -828,6 +863,11 @@ pub fn readStubMeta(io: std.Io, allocator: std.mem.Allocator, abs_path: []const 
 
     var meta = parseStubMeta(allocator, bytes, hasChatTemplate(io, allocator, dir));
     meta.has_mtp = mtp.dirAdvertisesMtp(io, allocator, dir);
+    if (@import("model.zig").parseConfigFromJson(allocator, bytes)) |parsed| {
+        var cfg = parsed;
+        defer cfg.deinit(allocator);
+        meta.context_cap = cfg.contextCap();
+    } else |_| {}
     if (dir.openFile(io, "generation_config.json", .{})) |gen| {
         defer gen.close(io);
         var gbuf: [4096]u8 = undefined;
@@ -1141,6 +1181,35 @@ test "discovery measures a SYMLINKED (HF hub cache) model dir's real bytes" {
     try testing.expectEqual(@as(usize, 1), result.models.len);
     try testing.expectEqualStrings("org/snap-model", result.models[0].id);
     try testing.expectEqual(@as(?u64, 10), result.models[0].bytes_on_disk);
+}
+
+test "discovery counts shard bytes that come through symlinks leaving the pack" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "elsewhere");
+    try tmp.dir.writeFile(io, .{ .sub_path = "elsewhere/engram.safetensors", .data = "0123456789abcdef" });
+    try tmp.dir.createDirPath(io, "pack");
+    try tmp.dir.writeFile(io, .{ .sub_path = "pack/config.json", .data = "{\"model_type\":\"mimo_v2\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pack/own.safetensors", .data = "0123" });
+    try tmp.dir.symLink(io, "../elsewhere/engram.safetensors", "pack/engram.safetensors", .{});
+    try tmp.dir.symLink(io, "own.safetensors", "pack/alias.safetensors", .{});
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqual(@as(?u64, 24), result.models[0].bytes_on_disk);
+    try testing.expectEqual(@as(u64, 16), result.models[0].bytes_linked);
+
+    var pack_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var pack_dir = try tmp.dir.openDir(io, "pack", .{});
+    defer pack_dir.close(io);
+    const pack_len = try pack_dir.realPath(io, &pack_buf);
+    const probe = try probeModelDir(io, allocator, pack_buf[0..pack_len]);
+    defer allocator.free(probe.model_type);
+    try testing.expectEqual(@as(u64, 16), probe.bytes_linked);
 }
 
 test "modelKindFromType labels every family (list TYPE column + run preflight)" {
@@ -1464,6 +1533,24 @@ test "readStubMeta: has_mtp follows the checkpoint's MTP head" {
     try std.testing.expect(readStubMeta(io, allocator, model_dir).has_mtp);
 }
 
+test "readStubMeta frees the config it parses for the context cap, pack revision included" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "m");
+    const glm = @embedFile("fixtures/glm5_config.json");
+    const stamped = try std.mem.concat(allocator, u8, &.{ "{\"pack_revision\":{\"id\":\"2.0\",\"unstamped\":[\"engram-a.safetensors\",\"engram-b.safetensors\"]},", glm[std.mem.indexOfScalar(u8, glm, '{').? + 1 ..] });
+    defer allocator.free(stamped);
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/config.json", .data = stamped });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const model_dir = try std.fmt.allocPrint(allocator, "{s}/m", .{path_buf[0..root_len]});
+    defer allocator.free(model_dir);
+
+    try std.testing.expect(readStubMeta(io, allocator, model_dir).context_cap > 0);
+}
+
 test "discovery skips a config.json whose root is not an object and drops a size past u32" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
@@ -1474,4 +1561,39 @@ test "discovery skips a config.json whose root is not an object and drops a size
         try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = content });
         try std.testing.expect(peekConfig(io, allocator, tmp.dir, ".") == .missing_or_unparseable);
     }
+}
+
+/// Test helper: a `<sub>/config.json` of a served arch, enough for discovery to list it.
+pub fn writePackStub(io: std.Io, dir: std.Io.Dir, sub: []const u8) !void {
+    try dir.createDirPath(io, sub);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/config.json", .{sub});
+    defer std.testing.allocator.free(path);
+    const body = try std.fmt.allocPrint(std.testing.allocator, "{{\"model_type\":\"{s}\"}}", .{supported_model_types[0]});
+    defer std.testing.allocator.free(body);
+    try dir.writeFile(io, .{ .sub_path = path, .data = body });
+}
+
+test "discovery below a root skips test-fixtures and dot folders at every depth, but a named root is scanned" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try writePackStub(io, tmp.dir, "org/pack");
+    try writePackStub(io, tmp.dir, "test-fixtures/x");
+    try writePackStub(io, tmp.dir, "org/test-fixtures");
+    try writePackStub(io, tmp.dir, ".hidden/y");
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+
+    var parent = try discoverModelsMany(io, allocator, &.{root});
+    defer parent.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parent.models.len);
+    try std.testing.expectEqualStrings("org/pack", parent.models[0].id);
+
+    const fixtures_root = try std.fmt.allocPrint(allocator, "{s}/test-fixtures", .{root});
+    defer allocator.free(fixtures_root);
+    var named = try discoverModelsMany(io, allocator, &.{fixtures_root});
+    defer named.deinit();
+    try std.testing.expectEqual(@as(usize, 1), named.models.len);
+    try std.testing.expectEqualStrings("x", named.models[0].id);
 }

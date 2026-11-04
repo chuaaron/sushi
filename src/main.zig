@@ -35,6 +35,7 @@ const encoder_cli = @import("sushi_encoder").cli;
 const launch_mod = @import("launch.zig");
 pub const log = @import("log.zig");
 const metrics_mod = @import("metrics.zig");
+const metrics_history = @import("metrics_history.zig");
 const sleep_inhibit_mod = @import("sleep_inhibit.zig");
 const version_mod = @import("version.zig");
 const parent_watch = @import("parent_watch.zig");
@@ -83,7 +84,7 @@ var prompt_client: ?*PromptClient = null;
 
 fn printUsage(io: std.Io) void {
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_w = std.Io.File.stdout().writer(io, &stdout_buf);
+    var stdout_w = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
     stdout_w.interface.writeAll(
         \\sushi — MLX inference server for Apple Silicon
         \\
@@ -139,10 +140,19 @@ fn printUsage(io: std.Io) void {
         \\                      (routed experts as EXL3). `sushi convert --help`
         \\                      for options
         \\  repack <pack>       Rewrite an STQ pack in place into the
-        \\                      pair-major layout (no flags). A shard is replaced
-        \\                      only after its rewrite reads back equal; a cut-off
-        \\                      run resumes when repeated. Stop any server using
-        \\                      the pack first. Never downloads.
+        \\                      pair-major layout. A shard is replaced only after
+        \\                      its rewrite reads back equal; a cut-off run
+        \\                      resumes when repeated. Stop any server using the
+        \\                      pack first. Never downloads. Options:
+        \\                      --pack-revision <id>  stamp the pack with a
+        \\                        revision (config.json and every shard header)
+        \\                      --shards <name-or-glob>  stamp only these shards
+        \\                        (repeatable; a pattern matching nothing is
+        \\                        refused)
+        \\                      --unstamped <shard>  leave this shard without a
+        \\                        stamp (repeatable; a symlinked shard needs it)
+        \\                      --check  read only: every shard not unstamped
+        \\                        carries the config's revision
         \\  update              Replace this install with the newest release,
         \\                      after checking its SHA-256, its signature and
         \\                      that it runs; the old one stays as
@@ -415,6 +425,7 @@ fn printUsage(io: std.Io) void {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
+    metrics_history.process.markStarted(io, io_util.nowMs(io));
 
     // Bound MLX's reclaimable buffer pool before anything can allocate. ONCE,
     // above every subcommand branch — a per-serve-path call is how
@@ -608,7 +619,7 @@ pub fn main(init: std.process.Init) !void {
                 .nax = transformer_mod.naxStatus(),
             };
             var ver_buf: [512]u8 = undefined;
-            var ver_w = std.Io.File.stdout().writer(io, &ver_buf);
+            var ver_w = std.Io.File.stdout().writerStreaming(io, &ver_buf);
             version_mod.writeReport(&ver_w.interface, info) catch {};
             ver_w.interface.flush() catch {};
             return;
@@ -617,7 +628,7 @@ pub fn main(init: std.process.Init) !void {
             defer _ = mlx.mlx_string_free(mlx_ver);
             try mlx.check(mlx.mlx_version(&mlx_ver));
             var out_buf: [1024]u8 = undefined;
-            var out_w = std.Io.File.stdout().writer(io, &out_buf);
+            var out_w = std.Io.File.stdout().writerStreaming(io, &out_buf);
             try version_mod.writeGuestManifest(&out_w.interface, allocator, .{
                 .version = VERSION,
                 .commit = build_options.git_sha,
@@ -1016,7 +1027,9 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     generate_mod.mtp_acceptance_explicit = mtp_typical_raw != null or mtp_tokenv3_raw != null;
+    var acceptance_flag_buf: [128]u8 = undefined;
     pinLaunchFlags(.{
+        .mtp_acceptance_flag = model_settings_mod.acceptanceFlagText(&acceptance_flag_buf, mtp_typical_raw, mtp_tokenv3_raw),
         .ctx_size = ctx_size,
         .kv_quant = if (kv_quant_explicit) kv_quant_config.wireName() else null,
         .mtp = if (mtp_explicit) enable_mtp else null,
@@ -1085,6 +1098,7 @@ pub fn main(init: std.process.Init) !void {
         if (!server_mod.prefix_cache_disk_explicit) if (model_settings_mod.server(&file).prefix_cache_disk_gb) |gb| {
             server_mod.prefix_cache_disk_bytes = @as(u64, gb) << 30;
             server_mod.prefix_cache_disk_explicit = true;
+            server_mod.prefix_cache_disk_from_file = true;
             log.info("[model-settings] server.prefix_cache_disk_gb {d} sets the SSD prefix cache budget\n", .{gb});
         };
     }
@@ -1124,6 +1138,7 @@ pub fn main(init: std.process.Init) !void {
     }
     defer log.closeFile();
     if (serve_mode and prompt == null and bench_run == null) update_mod.startDailyCheck(io, no_update_check);
+    cli_mod.configurePackUpdates(io, serve_mode and prompt == null and bench_run == null and !no_update_check);
 
     if (parent_pid) |pid| {
         parent_watch.start(pid) catch |err| {
@@ -1579,7 +1594,7 @@ pub fn main(init: std.process.Init) !void {
         const sampling = sampler.SamplingParams{ .temperature = temperature };
 
         var stdout_buf: [16 * 1024]u8 = undefined;
-        var stdout_w_state = std.Io.File.stdout().writer(io, &stdout_buf);
+        var stdout_w_state = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
         const stdout_w = &stdout_w_state.interface;
         defer stdout_w.flush() catch {};
 
@@ -1783,11 +1798,10 @@ fn runHeadlessServe(
         .prefix_cache_ram_enabled = server_mod.prefix_cache_ram_enabled,
         .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
         .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
-        .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
         .prefix_cache_disk_resolver = server_mod.prefixCacheDiskForLoad,
         .ssd_budget_bytes = ssd_budget_bytes,
         .expert_cache_fit_resolver = server_mod.expertCacheFitForLoad,
-        .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
+        .ssm_checkpoint_stride = server_mod.ssm_checkpoint_stride,
         .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
         .metrics = metrics_mod.current(),
@@ -1815,19 +1829,22 @@ fn configOverridesJsonValid(raw: []const u8) bool {
 
 /// A flag's whole-number value, or a named error and exit: a bad value never falls back to a default.
 /// Records which launch flags were given, so the settings API shows their keys locked: a flag outranks the file.
-fn pinLaunchFlags(given: struct { ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bool, vision: ?bool, models_dir: ?[]const u8 }) void {
+fn pinLaunchFlags(given: struct { mtp_acceptance_flag: ?[]const u8, ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bool, vision: ?bool, models_dir: ?[]const u8 }) void {
     const locks = &model_settings_mod.launch_locks;
     if (given.ctx_size > 0) locks.modelMut("ctx_size").pin("{d}", .{given.ctx_size});
     if (given.kv_quant) |q| locks.modelMut("kv_quant").pin("{s}", .{q});
     if (given.mtp) |m| locks.modelMut("mtp").pin("{s}", .{if (m) "on" else "off"});
-    if (generate_mod.mtp_acceptance_explicit) locks.modelMut("mtp_acceptance").pin("set", .{});
-    if (generate_mod.mtp_greedy_tail_explicit) locks.modelMut("mtp_greedy_tail").pin("set", .{});
+    if (given.mtp_acceptance_flag) |f| locks.modelMut("mtp_acceptance").pin("{s}", .{f});
+    if (generate_mod.mtp_greedy_tail_explicit) locks.modelMut("mtp_greedy_tail").pin("--mtp-greedy-tail", .{});
     if (ssd_budget_bytes != 0) locks.modelMut("ssd_budget_gb").pin("{d}", .{ssd_budget_bytes >> 30});
     if (model_mod.ssd_prefetch) |p| locks.modelMut("ssd_prefetch").pin("{d}", .{p});
     if (model_settings_mod.preserve_thinking_flag) |p| locks.modelMut("preserve_thinking").pin("{s}", .{if (p) "on" else "off"});
     if (model_settings_mod.think_penalty_flag) |l| locks.modelMut("think_penalty").pin("{d}", .{l});
     if (given.vision) |v| locks.modelMut("vision").pin("{s}", .{if (v) "on" else "off"});
-    if (server_mod.prefix_cache_disk_explicit) locks.prefix_cache_disk_gb.pin("{d}", .{server_mod.prefix_cache_disk_bytes >> 30});
+    if (server_mod.prefix_cache_disk_explicit) {
+        var size_buf: [32]u8 = undefined;
+        locks.prefix_cache_disk_gb.pin("{s}", .{model_settings_mod.sizeText(&size_buf, server_mod.prefix_cache_disk_bytes)});
+    }
     if (given.models_dir) |d| locks.models_dir.pin("{s}", .{d});
 }
 

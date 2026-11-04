@@ -187,7 +187,7 @@ pub fn installRefusal(io: std.Io, dir: []const u8, buf: []u8) ?[]const u8 {
 }
 
 /// The release tarball's entries; `.DS_Store` is Finder's.
-const release_entries = [_][]const u8{ "sushi", "lib", "LICENSE", "LICENSE-APACHE-2.0", "NOTICE", "guest.json", ".DS_Store" };
+const release_entries = [_][]const u8{ "sushi", "sushibar", "lib", "LICENSE", "LICENSE-APACHE-2.0", "NOTICE", "guest.json", ".DS_Store" };
 
 /// An entry of `dir` that neither the release layout nor `incoming` has: the swap would carry it away, so a folder
 /// holding anything else (a shared bin/) is never swapped.
@@ -429,7 +429,7 @@ fn checkOnce(io: std.Io) i64 {
 
 /// A fresh check for `sushi update --check` and the REPL's `/update`, recorded in the cache like the daily one.
 pub fn checkNow(arena: Allocator, io: std.Io, pre: bool) !?Release {
-    const f = try fetchReleases(arena, io, "");
+    const f = fetchReleases(arena, io, "") catch |err| return fail("could not reach the release server ({s})", .{@errorName(err)});
     if (f.status != 200) return fail("GitHub answered HTTP {d} for the release list", .{f.status});
     const r = try pickRelease(arena, f.body, pre);
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -623,6 +623,13 @@ fn execInPlace(arena: Allocator, argv: []const []const u8) void {
     _ = spawn(arena, argv, true, null) catch {};
 }
 
+/// Whether a process running `exe` stops the swap of `dir`: anything from the install but `sushibar`, which
+/// restarts itself on the new version and never holds `sushi` open.
+fn blocksUpdate(dir: []const u8, exe: []const u8) bool {
+    if (exe.len <= dir.len or !std.mem.startsWith(u8, exe, dir) or exe[dir.len] != '/') return false;
+    return !eql(u8, std.fs.path.basename(exe), "sushibar");
+}
+
 /// Another process running a binary from `dir`, or null.
 fn otherProcessIn(dir: []const u8) ?c_int {
     var pids: [8192]c_int = undefined;
@@ -634,8 +641,7 @@ fn otherProcessIn(dir: []const u8) ?c_int {
         if (pid == self or pid <= 0) continue;
         const len = proc_pidpath(pid, &buf, buf.len);
         if (len <= 0) continue;
-        const p = buf[0..@intCast(len)];
-        if (p.len > dir.len and std.mem.startsWith(u8, p, dir) and p[dir.len] == '/') return pid;
+        if (blocksUpdate(dir, buf[0..@intCast(len)])) return pid;
     }
     return null;
 }
@@ -719,7 +725,7 @@ pub fn cmdUpdate(allocator: Allocator, io: std.Io, args: []const []const u8) !vo
             opts.relaunch = args[i + 2 ..];
             break;
         } else if (eql(u8, a, "--help") or eql(u8, a, "-h")) {
-            var out = std.Io.File.stdout().writer(io, &.{});
+            var out = std.Io.File.stdout().writerStreaming(io, &.{});
             out.interface.writeAll(usage) catch {};
             return;
         } else {
@@ -949,6 +955,14 @@ fn relaunch(arena: Allocator, io: std.Io, argv: []const []const u8, result: anye
 // ── Tests ───────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "update: a process from the install blocks the swap, except the menu bar app" {
+    try testing.expect(blocksUpdate("/opt/s/sushi-macos-arm64", "/opt/s/sushi-macos-arm64/sushi"));
+    try testing.expect(blocksUpdate("/opt/s/sushi-macos-arm64", "/opt/s/sushi-macos-arm64/sushi-ubench"));
+    try testing.expect(!blocksUpdate("/opt/s/sushi-macos-arm64", "/opt/s/sushi-macos-arm64/sushibar"));
+    try testing.expect(!blocksUpdate("/opt/s/sushi-macos-arm64", "/opt/s/other/sushi"));
+    try testing.expect(!blocksUpdate("/opt/s/sushi-macos-arm64", "/opt/s/sushi-macos-arm64"));
+}
 
 test "update: the relaunch log line never carries the api key" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
