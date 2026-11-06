@@ -5687,16 +5687,31 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const sel = el('historyModel');
     if (!sel || !Array.isArray(models)) return;
     const current = sel.value;
-    const existing = new Set([...sel.options].map(o => o.value));
-    for (const m of models) {
-      if (m && !existing.has(m)) {
-        const opt = document.createElement('option');
-        opt.value = m;
-        opt.textContent = m.split('/').pop();
-        sel.appendChild(opt);
+    const seenValues = new Set(['all']);
+    const seenTexts = new Set(['All Models']);
+    const keepOptions = sel.options.length ? [sel.options[0]] : [];
+    for (let i = 1; i < sel.options.length; i++) {
+      const opt = sel.options[i];
+      if (!seenValues.has(opt.value) && !seenTexts.has(opt.textContent)) {
+        seenValues.add(opt.value);
+        seenTexts.add(opt.textContent);
+        keepOptions.push(opt);
       }
     }
-    sel.value = current;
+    for (const m of models) {
+      if (!m) continue;
+      const text = m.split('/').pop();
+      if (!seenValues.has(m) && !seenTexts.has(text)) {
+        const opt = document.createElement('option');
+        opt.value = m;
+        opt.textContent = text;
+        seenValues.add(m);
+        seenTexts.add(text);
+        keepOptions.push(opt);
+      }
+    }
+    sel.replaceChildren(...keepOptions);
+    sel.value = seenValues.has(current) ? current : 'all';
   }
   const hover = {}; // canvas id -> mouse x/y in CSS px while the pointer is over it
   const charts = {}; // canvas id -> last draw geometry, for hit-testing

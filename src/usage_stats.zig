@@ -284,13 +284,30 @@ pub const UsageStore = struct {
         defer self.unlock();
 
         var first = true;
+        var distinct_buf: [128][]const u8 = undefined;
+        var distinct_len: usize = 0;
+
         for (self.days[0..self.days_len]) |*b| {
             for (b.models[0..b.models_len]) |*m| {
-                if (first) {
-                    try w.print("\"{s}\"", .{m.getName()});
-                    first = false;
-                } else {
-                    try w.print(",\"{s}\"", .{m.getName()});
+                const name = m.getName();
+                var seen = false;
+                for (distinct_buf[0..distinct_len]) |s| {
+                    if (std.mem.eql(u8, s, name)) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) {
+                    if (distinct_len < distinct_buf.len) {
+                        distinct_buf[distinct_len] = name;
+                        distinct_len += 1;
+                    }
+                    if (first) {
+                        try w.print("\"{s}\"", .{name});
+                        first = false;
+                    } else {
+                        try w.print(",\"{s}\"", .{name});
+                    }
                 }
             }
         }
