@@ -7,6 +7,7 @@ OFFICIAL_BIN="$(which sushi 2>/dev/null || echo "/opt/homebrew/bin/sushi")"
 
 # 支持命令行参数指定，如:
 #   ./run_qwen_flash.sh 2.75 --local --cool --256k
+#   ./run_qwen_flash.sh 2.75-v2-uncensored --local --perf --256k
 #   ./run_qwen_flash.sh 4 --official --perf --clean --public --500k
 CLEAR_CACHE=false
 THERMAL_MODE=""
@@ -78,13 +79,15 @@ if [ -z "$QUANT_CHOICE" ]; then
     echo "=========================================="
     echo "请选择要启动的 Qwen3.8-Flash-Next 版本:"
     echo "  1) 4bpw                    (推荐用于 96GB+ 机器，wired_limit ~88GB)"
-    echo "  2) 2.75bpw                 (STQ 版本，适用于 64GB 机器，wired_limit ~59GB)"
-    echo "  3) 2.75bpw-uncensored      (STQ 版本 + 去除审查向量 china-v1)"
+    echo "  2) 2.75bpw v1.0            (STQ)"
+    echo "  3) 2.75bpw v1.0            (STQ + 去除审查向量 china-v1)"
     echo "  4) 4bpw-uncensored         (4bpw 版本 + 去除审查向量 china-v1)"
+    echo "  5) 2.75bpw v2.0            (STQ，需要 Sushi 1.5.1 或更新版本)"
+    echo "  6) 2.75bpw v2.0            (STQ + 去除审查向量 china-v1)"
     echo "=========================================="
-    read -rp "输入选项 [1, 2, 3 或 4，默认 2]: " USER_INPUT
+    read -rp "输入选项 [1–6，默认 6]: " USER_INPUT
     case "$USER_INPUT" in
-        2|2.75|2.75bpw|"")
+        2|2.75|2.75bpw)
             QUANT_CHOICE="2.75"
             ;;
         3|2.75-uncensored|uncensored)
@@ -92,6 +95,12 @@ if [ -z "$QUANT_CHOICE" ]; then
             ;;
         4|4-uncensored)
             QUANT_CHOICE="4-uncensored"
+            ;;
+        5|2.75-v2|2.75bpw-v2)
+            QUANT_CHOICE="2.75-v2"
+            ;;
+        6|2.75-v2-uncensored|"")
+            QUANT_CHOICE="2.75-v2-uncensored"
             ;;
         1|4|4bpw|*)
             QUANT_CHOICE="4"
@@ -111,9 +120,9 @@ if [ -z "$QUANT_CHOICE" ]; then
         echo "  1) 低温护机模式 (推荐日常: 降温省电, 限制MTP深度, Prefill保持2048满速)"
         echo "  2) 极致性能模式 (满血全开, 深度投机~50-58 tok/s, 发热与风扇较大)"
         echo "------------------------------------------"
-        read -rp "输入模式选项 [1 或 2，默认 1]: " THERMAL_CHOICE
+        read -rp "输入模式选项 [1 或 2，默认 2]: " THERMAL_CHOICE
         case "$THERMAL_CHOICE" in
-            2|perf|performance)
+            2|perf|performance|"")
                 THERMAL_MODE="perf"
                 ;;
             1|cool|eco|*)
@@ -177,8 +186,11 @@ if [ -z "$QUANT_CHOICE" ]; then
     fi
 fi
 
-THERMAL_MODE="${THERMAL_MODE:-cool}"
+THERMAL_MODE="${THERMAL_MODE:-perf}"
 
+MODEL_ROOT="$HOME/.sushi/models"
+STQ_V2=false
+MODEL_DIR_FLAGS=()
 CVECTOR_FLAG=()
 case "$QUANT_CHOICE" in
     2|2.75|2.75bpw)
@@ -189,6 +201,19 @@ case "$QUANT_CHOICE" in
         TARGET_LIMIT=69000
         MODEL_NAME="Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw"
         CVECTOR_FLAG=(--control-vector "$HOME/.lmstudio/models/zjj1993/Qwen3.8-Flash-Next-uncensored-china/china-v1.safetensors")
+        ;;
+    5|6|2.75-v2|2.75bpw-v2|2.75-v2-uncensored)
+        TARGET_LIMIT=69000
+        MODEL_NAME="Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw"
+        STQ_V2=true
+        MODEL_ROOT="$HOME/.sushi/pack-staging/qwen-flash-2.0/.sushi/models"
+        # 同名模型以第一个目录为准，同时保留常规模型目录中的 4bpw。
+        MODEL_DIR_FLAGS=(--model-dir "$MODEL_ROOT" --model-dir "$HOME/.sushi/models")
+        case "$QUANT_CHOICE" in
+            6|2.75-v2-uncensored)
+                CVECTOR_FLAG=(--control-vector "$HOME/.lmstudio/models/zjj1993/Qwen3.8-Flash-Next-uncensored-china/china-v1.safetensors")
+                ;;
+        esac
         ;;
     4|4-uncensored)
         TARGET_LIMIT=88000
@@ -201,38 +226,21 @@ case "$QUANT_CHOICE" in
         ;;
 esac
 
-MODEL_PATH="$HOME/.sushi/models/beamster/$MODEL_NAME"
-
-echo "📦 当前选择模型: $MODEL_NAME"
-
-# 1. 检查并按需设置 macOS 显存上限 (wired_limit_mb)
-CURRENT_LIMIT=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)
-
-if [ "$CURRENT_LIMIT" -lt "$TARGET_LIMIT" ]; then
-    echo "⚙️ 当前 iogpu.wired_limit_mb 为 ${CURRENT_LIMIT}MB，需要设置为 ${TARGET_LIMIT}MB..."
-    sudo sysctl iogpu.wired_limit_mb=$TARGET_LIMIT
-else
-    echo "✅ iogpu.wired_limit_mb 已就绪 (${CURRENT_LIMIT}MB >= ${TARGET_LIMIT}MB)，无需重复设置"
+MODEL_PATH="$MODEL_ROOT/beamster/$MODEL_NAME"
+MODEL_LABEL="$MODEL_NAME"
+if [ "$STQ_V2" = true ]; then
+    MODEL_LABEL="$MODEL_NAME v2.0"
 fi
 
-# 2. 检查模型目录是否存在
+echo "📦 当前选择模型: $MODEL_LABEL"
+
+# 1. 检查模型目录是否存在
 if [ ! -d "$MODEL_PATH" ]; then
-    echo "❌ 错误: 未找到模型目录: $MODEL_PATH"
-    echo "请确认是否已下载完成并放置在 ~/.sushi/models/beamster/$MODEL_NAME"
+    echo "❌ 错误: 未找到模型目录: $MODEL_PATH" >&2
     exit 1
 fi
 
-# 3. 按需清理 SSD 前缀缓存
-if [ "$CLEAR_CACHE" = true ]; then
-    CACHE_DIR="$HOME/.sushi/kv-cache"
-    if [ -d "$CACHE_DIR" ]; then
-        echo "🧹 正在清理 SSD 前缀缓存 ($CACHE_DIR/*)..."
-        rm -rf "$CACHE_DIR"/*
-        echo "✨ 缓存已清空"
-    fi
-fi
-
-# 4. 解析选择的 Sushi 二进制程序
+# 2. 解析选择的 Sushi 二进制程序
 BIN_CHOICE="${BIN_CHOICE:-local}"
 if [ "$BIN_CHOICE" = "official" ]; then
     SUSHI_BIN="$OFFICIAL_BIN"
@@ -248,8 +256,38 @@ else
     fi
 fi
 
+if [ "$STQ_V2" = true ]; then
+    SUSHI_VERSION=$("$SUSHI_BIN" --version 2>/dev/null) || SUSHI_VERSION=""
+    if ! [[ "$SUSHI_VERSION" =~ ^sushi[[:blank:]]+([0-9]+)\.([0-9]+)\.([0-9]+) ]] ||
+        ! (( BASH_REMATCH[1] > 1 || (BASH_REMATCH[1] == 1 &&
+            (BASH_REMATCH[2] > 5 || (BASH_REMATCH[2] == 5 && BASH_REMATCH[3] >= 1))) )); then
+        echo "❌ 2.75bpw v2.0 需要 Sushi 1.5.1 或更新版本。请选择兼容的内核（本机可用 --local）。" >&2
+        exit 1
+    fi
+fi
+
+# 3. 检查并按需设置 macOS 显存上限 (wired_limit_mb)
+CURRENT_LIMIT=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)
+
+if [ "$CURRENT_LIMIT" -lt "$TARGET_LIMIT" ]; then
+    echo "⚙️ 当前 iogpu.wired_limit_mb 为 ${CURRENT_LIMIT}MB，需要设置为 ${TARGET_LIMIT}MB..."
+    sudo sysctl iogpu.wired_limit_mb=$TARGET_LIMIT
+else
+    echo "✅ iogpu.wired_limit_mb 已就绪 (${CURRENT_LIMIT}MB >= ${TARGET_LIMIT}MB)，无需重复设置"
+fi
+
+# 4. 按需清理 SSD 前缀缓存
+if [ "$CLEAR_CACHE" = true ]; then
+    CACHE_DIR="$HOME/.sushi/kv-cache"
+    if [ -d "$CACHE_DIR" ]; then
+        echo "🧹 正在清理 SSD 前缀缓存 ($CACHE_DIR/*)..."
+        rm -rf "$CACHE_DIR"/*
+        echo "✨ 缓存已清空"
+    fi
+fi
+
 CTX_SIZE="${CTX_SIZE:-262144}"
-echo "🚀 启动 sushi 服务 ($MODEL_NAME | 内核: $BIN_DESC)..."
+echo "🚀 启动 sushi 服务 ($MODEL_LABEL | 内核: $BIN_DESC)..."
 echo "🧠 上下文容量: $((CTX_SIZE / 1024))K (${CTX_SIZE} tokens)"
 
 # 5. 组装网络绑定参数
@@ -283,6 +321,7 @@ fi
 
 exec "${RUN_CMD[@]}" \
   --model "$MODEL_PATH" \
+  ${MODEL_DIR_FLAGS[@]+"${MODEL_DIR_FLAGS[@]}"} \
   ${HOST_FLAGS[@]+"${HOST_FLAGS[@]}"} \
   --qwen-gdn 16 \
   ${CVECTOR_FLAG[@]+"${CVECTOR_FLAG[@]}"} \
